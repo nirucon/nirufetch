@@ -1,16 +1,15 @@
 /*
  * nirufetch.c - A simple system information fetcher inspired by other *fetch scripts, using Font Awesome icons.
- * OS support: only Arch Linux at the moment...
- * Version: 0.1
+ * pm support (packages): pacman, dpkg, rpm
+ * Version: 0.2
  * Author: Nicklas Rudolfsson https://github.com/nirucon
  * License: None = FREE
  *
  * Dependencies:
  * - Font Awesome (for icons)
  * - GNU Core Utilities (uname, df, etc.)
- * - Pacman (for counting installed packages)
  * - curl (for fetching public IP)
- * - iproute2 (for fetching local IP)
+ * - iproute2 or net-tools (for fetching local IP)
  * 
  * To build and install:
  * 1. Save this file as `nirufetch.c`.
@@ -101,7 +100,18 @@ void get_packages() {
     int count = 0;
     char path[1035];
 
-    fp = popen("pacman -Qq | wc -l", "r");
+    // Detect package manager and count installed packages
+    if (access("/usr/bin/pacman", F_OK) == 0) {
+        fp = popen("pacman -Qq | wc -l", "r");
+    } else if (access("/usr/bin/dpkg", F_OK) == 0) {
+        fp = popen("dpkg-query -f '${binary:Package}\n' -W | wc -l", "r");
+    } else if (access("/usr/bin/rpm", F_OK) == 0) {
+        fp = popen("rpm -qa | wc -l", "r");
+    } else {
+        print_info("\uf187  ", "Package manager not supported");
+        return;
+    }
+
     if (fp == NULL) {
         printf("Failed to run command\n");
         exit(EXIT_FAILURE);
@@ -112,8 +122,36 @@ void get_packages() {
     }
 
     char package_info[256];
-    snprintf(package_info, sizeof(package_info), "%d (pacman)", count);
+    snprintf(package_info, sizeof(package_info), "%d packages installed", count);
     print_info("\uf187  ", package_info);
+    pclose(fp);
+}
+
+void get_flatpak_packages() {
+    FILE *fp;
+    int count = 0;
+    char path[1035];
+
+    // Check if Flatpak is installed
+    if (access("/usr/bin/flatpak", F_OK) != 0) {
+        print_info("\uf17b  ", "Flatpak not installed");
+        return;
+    }
+
+    // Count the number of installed Flatpak applications
+    fp = popen("flatpak list --app --columns=application | wc -l", "r");
+    if (fp == NULL) {
+        printf("Failed to run command\n");
+        exit(EXIT_FAILURE);
+    }
+
+    while (fgets(path, sizeof(path), fp) != NULL) {
+        count = atoi(path);
+    }
+
+    char flatpak_info[256];
+    snprintf(flatpak_info, sizeof(flatpak_info), "%d Flatpak packages installed", count);
+    print_info("\uf17b  ", flatpak_info);
     pclose(fp);
 }
 
@@ -194,7 +232,15 @@ void get_ip() {
     char public_ip[1035];
 
     // Get local IP
-    fp = popen("ip -4 addr show | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | grep -v '127.0.0.1'", "r");
+    if (access("/usr/sbin/ip", F_OK) == 0) {
+        fp = popen("ip -4 addr show | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | grep -v '127.0.0.1'", "r");
+    } else if (access("/sbin/ifconfig", F_OK) == 0) {
+        fp = popen("ifconfig | grep -oP 'inet \\K\\d+(\\.\\d+){3}' | grep -v '127.0.0.1'", "r");
+    } else {
+        print_info("\uf0ac  ", "Local IP not available");
+        return;
+    }
+
     if (fp == NULL) {
         printf("Failed to run command\n");
         exit(EXIT_FAILURE);
@@ -204,7 +250,7 @@ void get_ip() {
         local_ip[strcspn(local_ip, "\n")] = 0;  // Remove newline character
         print_info("\uf0ac  ", local_ip);
     } else {
-        printf("Local IP:    Not available\n");
+        print_info("\uf0ac  ", "Local IP not available");
     }
     pclose(fp);
 
@@ -219,7 +265,7 @@ void get_ip() {
         public_ip[strcspn(public_ip, "\n")] = 0;  // Remove newline character
         print_info("\uf0ac  ", public_ip);
     } else {
-        printf("Public IP:    Not available\n");
+        print_info("\uf0ac  ", "Public IP not available");
     }
     pclose(fp);
 }
@@ -229,6 +275,7 @@ int main() {
     get_os();
     get_uptime();
     get_packages();
+    get_flatpak_packages();
     get_shell();
     get_cpu();
     get_memory();
@@ -237,4 +284,3 @@ int main() {
 
     return 0;
 }
-
