@@ -23,6 +23,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <time.h>
+#include <sys/stat.h>
 
 void print_info(const char *icon, const char *text) {
     printf("%s %s\n", icon, text);
@@ -93,6 +95,29 @@ void get_uptime() {
     char uptime_info[256];
     snprintf(uptime_info, sizeof(uptime_info), "%d days, %d hours, %d minutes", days, hours, minutes);
     print_info("\uf017  ", uptime_info);
+}
+
+void get_installation_date() {
+    struct stat st;
+
+    // Get the creation time (birth time) of the root directory
+    if (stat("/", &st) == 0) {
+        // Convert the time to human-readable format
+        char date[256];
+        strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", localtime(&st.st_ctime));
+
+        // Calculate the number of days since installation
+        time_t now = time(NULL);
+        double seconds_since_install = difftime(now, st.st_ctime);
+        int days_since_install = seconds_since_install / (60 * 60 * 24);
+
+        // Print the installation date and the number of days since installation
+        char install_info[512];
+        snprintf(install_info, sizeof(install_info), "%s (%d days ago)", date, days_since_install);
+        print_info("\uf073  ", install_info);
+    } else {
+        print_info("\uf073  ", "Installation date not available");
+    }
 }
 
 void get_packages() {
@@ -274,6 +299,7 @@ int main() {
     get_hostname();
     get_os();
     get_uptime();
+    get_installation_date();
     get_packages();
     get_flatpak_packages();
     get_shell();
