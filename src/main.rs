@@ -205,6 +205,27 @@ fn logo() -> [&'static str; 6] {
     ]
 }
 
+fn terminal_width() -> usize {
+    if !io::stdout().is_terminal() { return 44; }
+    let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0 && winsize.ws_col > 0 {
+        winsize.ws_col as usize
+    } else { 44 }
+}
+
+fn fit(value: &str, width: usize) -> String {
+    if value.chars().count() <= width { return value.to_string(); }
+    if width == 0 { return String::new(); }
+    if width == 1 { return "…".into(); }
+    value.chars().take(width - 1).collect::<String>() + "…"
+}
+
+fn short_cpu(value: &str) -> String {
+    let mut v = value.replace("(R)", "").replace("(TM)", "").replace("CPU", "");
+    if let Some((head, _)) = v.split_once(" @ ") { v = head.to_string(); }
+    v.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version") {
@@ -212,7 +233,7 @@ fn main() {
         return;
     }
     if args.iter().any(|arg| arg == "--help") {
-        println!("Usage: nirufetch [--no-color] [--no-logo] [--plain]");
+        println!("Usage: nirufetch [--classic] [--compact] [--full] [--no-color] [--no-logo] [--plain]");
         println!("NIRU terminal system fetch. Reads local files; no network or daemon.");
         return;
     }
@@ -225,7 +246,8 @@ fn main() {
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true),
         palette: theme().1,
     };
-    let show_logo = !args
+    let classic = args.iter().any(|arg| arg == "--classic");
+    let show_logo = classic && !args
         .iter()
         .any(|arg| arg == "--no-logo" || arg == "--plain");
     let (theme_name, _) = theme();
@@ -280,6 +302,54 @@ fn main() {
         ("Theme".to_string(), theme_name),
     ];
     info.retain(|(_, value)| !value.is_empty());
+
+    if !classic {
+        let plain = args.iter().any(|arg| arg == "--plain");
+        let full = args.iter().any(|arg| arg == "--full");
+        let compact = args.iter().any(|arg| arg == "--compact");
+        let width = terminal_width().min(if full { usize::MAX } else { 44 });
+        let width = width.max(1);
+        let label_width = if compact || width < 30 { 5 } else { 8 };
+        let gap = 2;
+        let value_width = width.saturating_sub(label_width + gap);
+        let line = "─".repeat(width);
+        println!("{}", style.paint(&fit("NIRUX", width), style.palette.accent, true));
+        if !compact && width >= 22 {
+            println!("{}", style.paint(&fit("A minimal X11 desktop", width), style.palette.muted, false));
+        }
+        println!("{}", style.paint(&line, style.palette.border, false));
+        println!();
+        println!("{}", style.paint(&fit(&format!("{}@{}", username(), hostname()), width), style.palette.accent, true));
+        println!();
+        for (index, (label, value)) in info.iter().enumerate() {
+            if index == 7 { println!(); }
+            let label = match label.as_str() {
+                "Terminal" if label_width == 5 => "Term",
+                "Kernel" if label_width == 5 => "Kern",
+                "Memory" if label_width == 5 => "Mem",
+                "Uptime" if label_width == 5 => "Up",
+                "Theme" if label_width == 5 => "Theme",
+                other => other,
+            };
+            let display = match info[index].0.as_str() {
+                "OS" if !full => value.replace("Debian GNU/Linux", "Debian").replace(" (trixie)", " (trixie)"),
+                "CPU" if !full => short_cpu(value),
+                "Terminal" if !full && value == "xterm-kitty" => "kitty".into(),
+                _ => value.clone(),
+            };
+            if width <= label_width + gap {
+                println!("{}", style.paint(&fit(&format!("{label} {display}"), width), style.palette.foreground, false));
+                continue;
+            }
+            let display = if full { display } else { fit(&display, value_width) };
+            println!("{}  {}", style.paint(&format!("{label:<label_width$}"), style.palette.muted, false), style.paint(&display, style.palette.foreground, false));
+        }
+        if !plain && !compact && width >= 20 {
+            println!();
+            println!("{}", style.paint(&line, style.palette.border, false));
+        }
+        return;
+    }
 
     let title = format!("{}@{}", username(), hostname());
     println!("{}", style.paint(&title, style.palette.accent, true));
