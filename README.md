@@ -23,6 +23,9 @@ cd nirufetch
 nirufetch
 nirufetch --plain
 nirufetch --no-logo
+nirufetch --compact
+nirufetch --classic
+nirufetch --full
 ```
 
 `--plain` and `--no-color` are also honoured through `NO_COLOR`. The theme
@@ -37,3 +40,7 @@ cargo build --release --locked
 ```
 
 MIT. Copyright 2026 Nicklas Rudolfsson.
+
+## Layout
+
+The default layout is a narrow, aligned NIRUX system summary (up to 44 terminal columns) that adapts to tiled terminals. Use `--compact` for smaller windows, `--classic` for the original large ASCII logo, and `--full` to avoid value truncation. The default layout displays the NIRUX identity and the tagline “A minimal X11 desktop”.
