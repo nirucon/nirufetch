@@ -206,23 +206,40 @@ fn logo() -> [&'static str; 6] {
 }
 
 fn terminal_width() -> usize {
-    if !io::stdout().is_terminal() { return 44; }
+    if !io::stdout().is_terminal() {
+        return 44;
+    }
     let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0 && winsize.ws_col > 0 {
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0
+        && winsize.ws_col > 0
+    {
         winsize.ws_col as usize
-    } else { 44 }
+    } else {
+        44
+    }
 }
 
 fn fit(value: &str, width: usize) -> String {
-    if value.chars().count() <= width { return value.to_string(); }
-    if width == 0 { return String::new(); }
-    if width == 1 { return "…".into(); }
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
     value.chars().take(width - 1).collect::<String>() + "…"
 }
 
 fn short_cpu(value: &str) -> String {
-    let mut v = value.replace("(R)", "").replace("(TM)", "").replace("CPU", "");
-    if let Some((head, _)) = v.split_once(" @ ") { v = head.to_string(); }
+    let mut v = value
+        .replace("(R)", "")
+        .replace("(TM)", "")
+        .replace("CPU", "");
+    if let Some((head, _)) = v.split_once(" @ ") {
+        v = head.to_string();
+    }
     v.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -233,7 +250,9 @@ fn main() {
         return;
     }
     if args.iter().any(|arg| arg == "--help") {
-        println!("Usage: nirufetch [--classic] [--compact] [--full] [--no-color] [--no-logo] [--plain]");
+        println!(
+            "Usage: nirufetch [--classic] [--compact] [--full] [--no-color] [--no-logo] [--plain]"
+        );
         println!("NIRU terminal system fetch. Reads local files; no network or daemon.");
         return;
     }
@@ -247,9 +266,10 @@ fn main() {
         palette: theme().1,
     };
     let classic = args.iter().any(|arg| arg == "--classic");
-    let show_logo = classic && !args
-        .iter()
-        .any(|arg| arg == "--no-logo" || arg == "--plain");
+    let show_logo = classic
+        && !args
+            .iter()
+            .any(|arg| arg == "--no-logo" || arg == "--plain");
     let (theme_name, _) = theme();
     let mem = memory();
     let disk = disk();
@@ -263,7 +283,7 @@ fn main() {
         ),
         (
             "WM".to_string(),
-            component(env::var("XDG_CURRENT_DESKTOP").ok(), "X11"),
+            component(env::var("XDG_CURRENT_DESKTOP").ok(), "unknown"),
         ),
         (
             "Terminal".to_string(),
@@ -307,22 +327,45 @@ fn main() {
         let plain = args.iter().any(|arg| arg == "--plain");
         let full = args.iter().any(|arg| arg == "--full");
         let compact = args.iter().any(|arg| arg == "--compact");
-        let width = terminal_width().min(if full { usize::MAX } else { 44 });
+        let width = if full {
+            terminal_width()
+        } else {
+            terminal_width().min(44)
+        };
         let width = width.max(1);
         let label_width = if compact || width < 30 { 5 } else { 8 };
         let gap = 2;
         let value_width = width.saturating_sub(label_width + gap);
         let line = "─".repeat(width);
-        println!("{}", style.paint(&fit("NIRUX", width), style.palette.accent, true));
+        println!(
+            "{}",
+            style.paint(&fit("NIRUX", width), style.palette.accent, true)
+        );
         if !compact && width >= 22 {
-            println!("{}", style.paint(&fit("A minimal X11 desktop", width), style.palette.muted, false));
+            println!(
+                "{}",
+                style.paint(
+                    &fit("A minimal X11 desktop", width),
+                    style.palette.muted,
+                    false
+                )
+            );
         }
         println!("{}", style.paint(&line, style.palette.border, false));
         println!();
-        println!("{}", style.paint(&fit(&format!("{}@{}", username(), hostname()), width), style.palette.accent, true));
+        println!(
+            "{}",
+            style.paint(
+                &fit(&format!("{}@{}", username(), hostname()), width),
+                style.palette.accent,
+                true
+            )
+        );
         println!();
         for (index, (label, value)) in info.iter().enumerate() {
-            if index == 7 { println!(); }
+            if index == 7 {
+                println!();
+            }
             let label = match label.as_str() {
                 "Terminal" if label_width == 5 => "Term",
                 "Kernel" if label_width == 5 => "Kern",
@@ -332,17 +375,36 @@ fn main() {
                 other => other,
             };
             let display = match info[index].0.as_str() {
-                "OS" if !full => value.replace("Debian GNU/Linux", "Debian").replace(" (trixie)", " (trixie)"),
+                "OS" if !full => value.replace("Debian GNU/Linux", "Debian"),
                 "CPU" if !full => short_cpu(value),
                 "Terminal" if !full && value == "xterm-kitty" => "kitty".into(),
                 _ => value.clone(),
             };
             if width <= label_width + gap {
-                println!("{}", style.paint(&fit(&format!("{label} {display}"), width), style.palette.foreground, false));
+                println!(
+                    "{}",
+                    style.paint(
+                        &fit(&format!("{label} {display}"), width),
+                        style.palette.foreground,
+                        false
+                    )
+                );
                 continue;
             }
-            let display = if full { display } else { fit(&display, value_width) };
-            println!("{}  {}", style.paint(&format!("{label:<label_width$}"), style.palette.muted, false), style.paint(&display, style.palette.foreground, false));
+            let display = if full {
+                display
+            } else {
+                fit(&display, value_width)
+            };
+            println!(
+                "{}  {}",
+                style.paint(
+                    &format!("{label:<label_width$}"),
+                    style.palette.muted,
+                    false
+                ),
+                style.paint(&display, style.palette.foreground, false)
+            );
         }
         if !plain && !compact && width >= 20 {
             println!();
@@ -412,5 +474,18 @@ mod tests {
     fn basename_handles_paths() {
         assert_eq!(basename("/usr/bin/fish"), "fish");
         assert_eq!(basename("fish"), "fish");
+    }
+
+    #[test]
+    fn fit_uses_cell_ellipsis() {
+        assert_eq!(fit("abc", 3), "abc");
+        assert_eq!(fit("abcd", 3), "ab…");
+        assert_eq!(fit("abcd", 1), "…");
+    }
+
+    #[test]
+    fn cpu_shortening_removes_trademark_and_frequency() {
+        let short = short_cpu("11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz");
+        assert_eq!(short, "11th Gen Intel Core i7-1165G7");
     }
 }
