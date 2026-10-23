@@ -213,6 +213,18 @@ fn theme() -> (String, Palette) {
             palette.muted = (0x93, 0xa6, 0xb2);
             palette.border = (0x24, 0x38, 0x46);
         }
+        "niru-the-norns" => {
+            palette.accent = (0xc9, 0xc2, 0xb9);
+            palette.foreground = (0xec, 0xe9, 0xe4);
+            palette.muted = (0xa6, 0xa1, 0x9b);
+            palette.border = (0x3b, 0x39, 0x36);
+        }
+        "niru-winter-nights" => {
+            palette.accent = (0xd8, 0xc4, 0xaa);
+            palette.foreground = (0xea, 0xd9, 0xc3);
+            palette.muted = (0xb9, 0xaa, 0x9a);
+            palette.border = (0x4e, 0x51, 0x57);
+        }
         _ => {}
     }
     (name, palette)

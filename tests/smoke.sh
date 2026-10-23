@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 BIN=${1:?usage: smoke.sh BIN}
-[ "$("$BIN" --version)" = "NIRUFETCH 0.1.3" ]
+[ "$("$BIN" --version)" = "NIRUFETCH 0.1.4" ]
 out=$("$BIN" --plain)
 printf '%s\n' "$out" | grep -q '^OS'
 printf '%s\n' "$out" | grep -q 'Kernel'
