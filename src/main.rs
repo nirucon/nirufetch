@@ -189,6 +189,18 @@ fn theme() -> (String, Palette) {
             palette.muted = (0x7d, 0x6f, 0x5f);
             palette.border = (0xd8, 0xcd, 0xbb);
         }
+        "niru-forest-vigil" => {
+            palette.accent = (0x8a, 0xa8, 0x7e);
+            palette.foreground = (0xd8, 0xde, 0xd2);
+            palette.muted = (0x96, 0xa2, 0x92);
+            palette.border = (0x2b, 0x36, 0x2c);
+        }
+        "niru-blood-of-urdr" => {
+            palette.accent = (0xc9, 0x60, 0x50);
+            palette.foreground = (0xe8, 0xd6, 0xcf);
+            palette.muted = (0xb0, 0x9a, 0x92);
+            palette.border = (0x3a, 0x1d, 0x1b);
+        }
         _ => {}
     }
     (name, palette)
