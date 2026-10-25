@@ -2,7 +2,7 @@
 
 **Part of [NIRUX - A minimal X11 desktop by Nicklas Rudolfsson](https://github.com/nirucon/nirux).**
 
-**Early beta.** A fast, local terminal system fetch in the NIRU visual style.
+**Early beta.** A fast, local terminal system fetch in the NIRUX visual style.
 It reads `/proc`, `/etc` and the NIRUWM theme; no network, daemon or background
 service.
 
