@@ -2,7 +2,6 @@ use std::{
     env, fs,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// Where system files are read from. `NIRUFETCH_ROOT` points it at a fixture
@@ -82,14 +81,17 @@ fn os_name() -> String {
 }
 
 fn kernel() -> String {
-    Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".into())
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return "unknown".into();
+    }
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    let release = release.to_string_lossy().trim().to_string();
+    if release.is_empty() {
+        "unknown".into()
+    } else {
+        release
+    }
 }
 
 fn hostname() -> String {
@@ -677,6 +679,14 @@ mod tests {
         assert_eq!(format_uptime(59), "0m");
         assert_eq!(format_uptime(3_600), "1h 0m");
         assert_eq!(format_uptime(90_000), "1d 1h 0m");
+    }
+
+    #[test]
+    fn kernel_comes_from_uname_without_a_process() {
+        let release = read("/proc/sys/kernel/osrelease");
+        if !release.trim().is_empty() {
+            assert_eq!(kernel(), release.trim());
+        }
     }
 
     #[test]
