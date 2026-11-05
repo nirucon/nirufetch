@@ -1,3 +1,5 @@
+mod full;
+
 use std::{
     env, fs,
     io::{self, IsTerminal},
@@ -71,8 +73,12 @@ fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-fn os_name() -> String {
-    for line in read("/etc/os-release").lines() {
+fn os_name(sys: &Sys) -> String {
+    let mut text = sys.read("/etc/os-release");
+    if text.is_empty() {
+        text = sys.read("/usr/lib/os-release");
+    }
+    for line in text.lines() {
         if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
             return value.trim_matches('"').to_string();
         }
@@ -94,12 +100,12 @@ fn kernel() -> String {
     }
 }
 
-fn hostname() -> String {
+fn hostname(sys: &Sys) -> String {
     env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            let value = read("/etc/hostname").trim().to_string();
+            let value = sys.read("/etc/hostname").trim().to_string();
             (!value.is_empty()).then_some(value)
         })
         .unwrap_or_else(|| "nirux".into())
@@ -109,8 +115,8 @@ fn username() -> String {
     env::var("USER").unwrap_or_else(|_| "user".into())
 }
 
-fn uptime_seconds() -> u64 {
-    read("/proc/uptime")
+fn uptime_seconds(sys: &Sys) -> u64 {
+    sys.read("/proc/uptime")
         .split_whitespace()
         .next()
         .and_then(|value| value.parse::<f64>().ok())
@@ -130,8 +136,8 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-fn memory() -> Option<(u64, u64)> {
-    let text = read("/proc/meminfo");
+fn memory(sys: &Sys) -> Option<(u64, u64)> {
+    let text = sys.read("/proc/meminfo");
     let value = |key: &str| {
         text.lines()
             .find(|line| line.starts_with(key))
@@ -140,7 +146,7 @@ fn memory() -> Option<(u64, u64)> {
     };
     let total = value("MemTotal:")?;
     let available = value("MemAvailable:")?;
-    Some(((total - available) * 1024, total * 1024))
+    Some((total.saturating_sub(available) * 1024, total * 1024))
 }
 
 fn gib(bytes: u64) -> f64 {
@@ -155,7 +161,7 @@ fn disk() -> Option<(u64, u64)> {
     }
     let total = stat.f_blocks as u64 * stat.f_frsize as u64;
     let free = stat.f_bavail as u64 * stat.f_frsize as u64;
-    Some((total - free, total))
+    Some((total.saturating_sub(free), total))
 }
 
 /// Known terminal emulators, by process name (`comm`, at most 15 bytes) or
@@ -769,6 +775,11 @@ fn default_lines(
             "Kernel" if label_width == 5 => "Kern",
             "Memory" if label_width == 5 => "Mem",
             "Uptime" if label_width == 5 => "Up",
+            "Display" if label_width == 5 => "Disp",
+            "Battery" if label_width == 5 => "Bat",
+            "Packages" if label_width == 5 => "Pkgs",
+            "Locale" if label_width == 5 => "Lang",
+            "Extras" if label_width == 5 => "Extra",
             other => other,
         };
         let display = match key.as_str() {
@@ -805,6 +816,156 @@ fn default_lines(
     out
 }
 
+/// Everything nirufetch shows. The `extra` part is collected only for
+/// `--full` and `--json`.
+struct Info {
+    user: String,
+    host: String,
+    os: String,
+    nirux: Nirux,
+    kernel: String,
+    uptime: u64,
+    shell: String,
+    wm: String,
+    terminal: String,
+    cpu: Cpu,
+    memory: Option<(u64, u64)>,
+    disk: Option<(u64, u64)>,
+    theme: Theme,
+    extra: Option<Extra>,
+}
+
+struct Extra {
+    gpus: Vec<full::Gpu>,
+    outputs: Vec<full::Output>,
+    batteries: Vec<full::Battery>,
+    locale: Option<String>,
+    packages: Vec<(&'static str, usize)>,
+    swap: Option<(u64, u64)>,
+    load: Option<[f64; 3]>,
+    extras: Vec<(String, Option<String>)>,
+}
+
+fn locale() -> Option<String> {
+    ["LANG", "LC_ALL"]
+        .iter()
+        .filter_map(|key| env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+fn collect(sys: &Sys, theme: Theme, with_extra: bool) -> Info {
+    let state = nirux_state_dir();
+    let nirux = nirux_in(&state);
+    let extra = with_extra.then(|| Extra {
+        gpus: full::gpus(sys),
+        outputs: full::outputs(sys),
+        batteries: full::batteries(sys),
+        locale: locale(),
+        packages: full::packages(sys),
+        swap: full::swap(sys),
+        load: full::load(sys),
+        extras: full::extras(&state),
+    });
+    Info {
+        user: username(),
+        host: hostname(sys),
+        os: os_name(sys),
+        wm: window_manager(env::var("XDG_CURRENT_DESKTOP").ok().as_deref(), &nirux),
+        nirux,
+        kernel: kernel(),
+        uptime: uptime_seconds(sys),
+        shell: basename(&env::var("SHELL").unwrap_or_else(|_| "sh".into())),
+        terminal: terminal(sys),
+        cpu: cpu_info(sys),
+        memory: memory(sys),
+        disk: disk(),
+        theme,
+        extra,
+    }
+}
+
+fn usage(used: u64, total: u64, decimals: usize) -> String {
+    let percent = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    format!(
+        "{:.decimals$} GiB / {:.decimals$} GiB ({percent:.0}%)",
+        gib(used),
+        gib(total)
+    )
+}
+
+/// The labelled rows of the text layouts, in order. Empty values are dropped.
+fn rows(info: &Info, full: bool) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut push = |label: &str, value: String| rows.push((label.to_string(), value));
+    push("OS", info.os.clone());
+    push("NIRUX", info.nirux.suite.clone().unwrap_or_default());
+    push("Kernel", info.kernel.clone());
+    push("Uptime", format_uptime(info.uptime));
+    push("Shell", info.shell.clone());
+    push("WM", info.wm.clone());
+    push("Terminal", info.terminal.clone());
+    push("CPU", info.cpu.display(full));
+    let extra = info.extra.as_ref().filter(|_| full);
+    if let Some(extra) = extra {
+        for gpu in &extra.gpus {
+            push("GPU", gpu.display());
+        }
+    }
+    push(
+        "Memory",
+        info.memory
+            .map(|(used, total)| usage(used, total, 1))
+            .unwrap_or_else(|| "unknown".into()),
+    );
+    if let Some(extra) = extra {
+        if let Some((used, total)) = extra.swap {
+            push(
+                "Swap",
+                if total == 0 {
+                    "none".into()
+                } else {
+                    usage(used, total, 1)
+                },
+            );
+        }
+    }
+    push(
+        "Disk",
+        info.disk
+            .map(|(used, total)| usage(used, total, 0))
+            .unwrap_or_else(|| "unknown".into()),
+    );
+    if let Some(extra) = extra {
+        for output in &extra.outputs {
+            push("Display", output.display());
+        }
+        for battery in &extra.batteries {
+            push("Battery", battery.display());
+        }
+        push("Packages", full::packages_display(&extra.packages));
+        push("Locale", extra.locale.clone().unwrap_or_default());
+        if let Some([one, five, fifteen]) = extra.load {
+            push("Load", format!("{one:.2} {five:.2} {fifteen:.2}"));
+        }
+        push("Extras", full::extras_display(&extra.extras));
+    }
+    push(
+        "Theme",
+        if full {
+            format!("{} ({})", info.theme.name, info.theme.id)
+        } else {
+            info.theme.name.clone()
+        },
+    );
+    rows.retain(|(_, value)| !value.is_empty());
+    rows
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version") {
@@ -818,95 +979,38 @@ fn main() {
         println!("NIRU terminal system fetch. Reads local files; no network or daemon.");
         return;
     }
+    let flag = |name: &str| args.iter().any(|arg| arg == name);
+    let full = flag("--full");
+    let classic = flag("--classic");
     let theme = theme();
-    let nirux = nirux_in(&nirux_state_dir());
-    let full = args.iter().any(|arg| arg == "--full");
     let style = Style {
         colour: io::stdout().is_terminal()
             && env::var_os("NO_COLOR").is_none()
-            && !args
-                .iter()
-                .any(|arg| arg == "--no-color" || arg == "--plain")
+            && !flag("--no-color")
+            && !flag("--plain")
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true),
         palette: theme.palette,
     };
-    let classic = args.iter().any(|arg| arg == "--classic");
-    let show_logo = classic
-        && !args
-            .iter()
-            .any(|arg| arg == "--no-logo" || arg == "--plain");
     let sys = Sys::from_env();
-    let mem = memory();
-    let disk = disk();
-    let mut info = vec![
-        ("OS".to_string(), os_name()),
-        ("NIRUX".to_string(), nirux.suite.clone().unwrap_or_default()),
-        ("Kernel".to_string(), kernel()),
-        ("Uptime".to_string(), format_uptime(uptime_seconds())),
-        (
-            "Shell".to_string(),
-            basename(&env::var("SHELL").unwrap_or_else(|_| "sh".into())),
-        ),
-        (
-            "WM".to_string(),
-            window_manager(env::var("XDG_CURRENT_DESKTOP").ok().as_deref(), &nirux),
-        ),
-        ("Terminal".to_string(), terminal(&sys)),
-        ("CPU".to_string(), cpu_info(&sys).display(full)),
-        (
-            "Memory".to_string(),
-            mem.map(|(used, total)| {
-                format!(
-                    "{:.1} GiB / {:.1} GiB ({:.0}%)",
-                    gib(used),
-                    gib(total),
-                    used as f64 / total as f64 * 100.0
-                )
-            })
-            .unwrap_or_else(|| "unknown".into()),
-        ),
-        (
-            "Disk".to_string(),
-            disk.map(|(used, total)| {
-                format!(
-                    "{:.0} GiB / {:.0} GiB ({:.0}%)",
-                    gib(used),
-                    gib(total),
-                    used as f64 / total as f64 * 100.0
-                )
-            })
-            .unwrap_or_else(|| "unknown".into()),
-        ),
-        (
-            "Theme".to_string(),
-            if full {
-                format!("{} ({})", theme.name, theme.id)
-            } else {
-                theme.name.clone()
-            },
-        ),
-    ];
-    info.retain(|(_, value)| !value.is_empty());
-
-    if !classic {
+    let info = collect(&sys, theme, full);
+    let title = format!("{}@{}", info.user, info.host);
+    let rows = rows(&info, full);
+    let lines = if classic {
+        classic_lines(
+            &title,
+            &rows,
+            &style,
+            !flag("--no-logo") && !flag("--plain"),
+        )
+    } else {
         let layout = Layout {
-            compact: args.iter().any(|arg| arg == "--compact"),
+            compact: flag("--compact"),
             full,
-            plain: args.iter().any(|arg| arg == "--plain"),
+            plain: flag("--plain"),
         };
-        let title = format!("{}@{}", username(), hostname());
-        for line in default_lines(&title, &info, &style, layout, terminal_width()) {
-            println!("{line}");
-        }
-        return;
-    }
-
-    for line in classic_lines(
-        &format!("{}@{}", username(), hostname()),
-        &info,
-        &style,
-        show_logo,
-    ) {
+        default_lines(&title, &rows, &style, layout, terminal_width())
+    };
+    for line in lines {
         println!("{line}");
     }
 }
@@ -971,7 +1075,7 @@ fn classic_lines(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
