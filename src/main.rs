@@ -291,14 +291,75 @@ fn terminal(sys: &Sys) -> String {
         })
 }
 
-fn cpu_model() -> String {
-    let text = read("/proc/cpuinfo");
-    text.lines()
-        .find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            (key.trim() == "model name").then(|| value.trim().to_string())
-        })
-        .unwrap_or_else(|| "CPU".into())
+struct Cpu {
+    model: String,
+    cores: Option<usize>,
+    threads: Option<usize>,
+}
+
+impl Cpu {
+    fn counts(&self) -> String {
+        match (self.cores, self.threads) {
+            (Some(cores), Some(threads)) => format!(" ({cores}C/{threads}T)"),
+            (None, Some(threads)) => format!(" ({threads}T)"),
+            _ => String::new(),
+        }
+    }
+
+    /// The cleaned model name with core/thread counts; `--full` keeps the raw
+    /// model string.
+    fn display(&self, full: bool) -> String {
+        let name = if full {
+            self.model.clone()
+        } else {
+            short_cpu(&self.model)
+        };
+        format!("{name}{}", self.counts())
+    }
+}
+
+/// Model name and topology from `/proc/cpuinfo`. Threads are the logical
+/// processors; cores are the distinct (physical id, core id) pairs, or
+/// `cpu cores` per package when those ids are missing.
+fn cpu_info(sys: &Sys) -> Cpu {
+    let text = sys.read("/proc/cpuinfo");
+    let mut model = None;
+    let mut threads = 0;
+    let mut physical = String::new();
+    let mut pairs = std::collections::BTreeSet::new();
+    let mut packages = std::collections::BTreeSet::new();
+    let mut cores_per_package = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "processor" => threads += 1,
+            "model name" | "Model" | "Hardware" if model.is_none() && !value.is_empty() => {
+                model = Some(value.to_string())
+            }
+            "physical id" => {
+                physical = value.to_string();
+                packages.insert(value.to_string());
+            }
+            "core id" => {
+                pairs.insert((physical.clone(), value.to_string()));
+            }
+            "cpu cores" => cores_per_package = value.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let cores = if !pairs.is_empty() {
+        Some(pairs.len())
+    } else {
+        cores_per_package.map(|cores| cores * packages.len().max(1))
+    };
+    Cpu {
+        model: model.unwrap_or_else(|| "CPU".into()),
+        cores: cores.filter(|&cores| cores > 0 && threads > 0),
+        threads: (threads > 0).then_some(threads),
+    }
 }
 
 fn basename(value: &str) -> String {
@@ -597,18 +658,21 @@ fn logo() -> [&'static str; 6] {
     ]
 }
 
-fn terminal_width() -> usize {
-    if !io::stdout().is_terminal() {
-        return 44;
+/// The terminal width from `TIOCGWINSZ` on stdout, else a positive
+/// `$COLUMNS`, else unknown.
+fn terminal_width() -> Option<usize> {
+    if io::stdout().is_terminal() {
+        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0
+            && winsize.ws_col > 0
+        {
+            return Some(winsize.ws_col as usize);
+        }
     }
-    let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0
-        && winsize.ws_col > 0
-    {
-        winsize.ws_col as usize
-    } else {
-        44
-    }
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.trim().parse::<usize>().ok())
+        .filter(|&columns| columns > 0)
 }
 
 fn fit(value: &str, width: usize) -> String {
@@ -624,15 +688,121 @@ fn fit(value: &str, width: usize) -> String {
     value.chars().take(width - 1).collect::<String>() + "…"
 }
 
+/// Strip vendor noise from a CPU model: trademark marks, "CPU", the clock
+/// ("@ 3.30GHz"), integrated graphics ("w/ Radeon 890M", "with Radeon
+/// Graphics") and "N-Core Processor".
 fn short_cpu(value: &str) -> String {
-    let mut v = value
-        .replace("(R)", "")
-        .replace("(TM)", "")
-        .replace("CPU", "");
-    if let Some((head, _)) = v.split_once(" @ ") {
-        v = head.to_string();
+    let mut v = value.to_string();
+    for mark in ["(R)", "(r)", "(TM)", "(tm)", "®", "™"] {
+        v = v.replace(mark, "");
     }
-    v.split_whitespace().collect::<Vec<_>>().join(" ")
+    for cut in [" @ ", " w/ ", " with "] {
+        if let Some(at) = v.to_ascii_lowercase().find(cut) {
+            v.truncate(at);
+        }
+    }
+    let short = v
+        .split_whitespace()
+        .filter(|word| {
+            !matches!(*word, "CPU" | "Processor") && !word.to_ascii_lowercase().ends_with("-core")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if short.is_empty() {
+        value.trim().to_string()
+    } else {
+        short
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Layout {
+    compact: bool,
+    full: bool,
+    plain: bool,
+}
+
+/// The default (and `--compact`/`--full`) layout. The header and rules stay
+/// within 44 columns; values use the rest of the terminal width and are cut
+/// only when they still do not fit. `width` is `None` when it is unknown (not
+/// a terminal), and then nothing is cut.
+fn default_lines(
+    title: &str,
+    info: &[(String, String)],
+    style: &Style,
+    layout: Layout,
+    width: Option<usize>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let available = width.unwrap_or(usize::MAX).max(1);
+    let rule_width = if layout.full {
+        width.unwrap_or(44).max(1)
+    } else {
+        available.min(44)
+    };
+    let label_width = if layout.compact || rule_width < 30 {
+        5
+    } else {
+        8
+    };
+    let gap = 2;
+    let value_width = available.saturating_sub(label_width + gap);
+    let line = "─".repeat(rule_width);
+    out.push(style.paint(&fit("NIRUX", rule_width), style.palette.accent, true));
+    if !layout.compact && rule_width >= 22 {
+        out.push(style.paint(
+            &fit("A minimal X11 desktop", rule_width),
+            style.palette.muted,
+            false,
+        ));
+    }
+    out.push(style.paint(&line, style.palette.border, false));
+    out.push(String::new());
+    out.push(style.paint(&fit(title, available), style.palette.accent, true));
+    out.push(String::new());
+    for (index, (key, value)) in info.iter().enumerate() {
+        if key == "Memory" && index > 0 {
+            out.push(String::new());
+        }
+        let label = match key.as_str() {
+            "Terminal" if label_width == 5 => "Term",
+            "Kernel" if label_width == 5 => "Kern",
+            "Memory" if label_width == 5 => "Mem",
+            "Uptime" if label_width == 5 => "Up",
+            other => other,
+        };
+        let display = match key.as_str() {
+            "OS" if !layout.full => value.replace("Debian GNU/Linux", "Debian"),
+            _ => value.clone(),
+        };
+        if available <= label_width + gap {
+            out.push(style.paint(
+                &fit(&format!("{label} {display}"), available),
+                style.palette.foreground,
+                false,
+            ));
+            continue;
+        }
+        let display = if layout.full {
+            display
+        } else {
+            fit(&display, value_width)
+        };
+        out.push(format!(
+            "{}  {}",
+            style.paint(
+                &format!("{label:<label_width$}"),
+                style.palette.muted,
+                false
+            ),
+            style.paint(&display, style.palette.foreground, false)
+        ));
+    }
+    if !layout.plain && !layout.compact && rule_width >= 20 {
+        out.push(String::new());
+        out.push(style.paint(&line, style.palette.border, false));
+    }
+    out
 }
 
 fn main() {
@@ -682,7 +852,7 @@ fn main() {
             window_manager(env::var("XDG_CURRENT_DESKTOP").ok().as_deref(), &nirux),
         ),
         ("Terminal".to_string(), terminal(&sys)),
-        ("CPU".to_string(), cpu_model()),
+        ("CPU".to_string(), cpu_info(&sys).display(full)),
         (
             "Memory".to_string(),
             mem.map(|(used, total)| {
@@ -719,89 +889,14 @@ fn main() {
     info.retain(|(_, value)| !value.is_empty());
 
     if !classic {
-        let plain = args.iter().any(|arg| arg == "--plain");
-        let compact = args.iter().any(|arg| arg == "--compact");
-        let width = if full {
-            terminal_width()
-        } else {
-            terminal_width().min(44)
+        let layout = Layout {
+            compact: args.iter().any(|arg| arg == "--compact"),
+            full,
+            plain: args.iter().any(|arg| arg == "--plain"),
         };
-        let width = width.max(1);
-        let label_width = if compact || width < 30 { 5 } else { 8 };
-        let gap = 2;
-        let value_width = width.saturating_sub(label_width + gap);
-        let line = "─".repeat(width);
-        println!(
-            "{}",
-            style.paint(&fit("NIRUX", width), style.palette.accent, true)
-        );
-        if !compact && width >= 22 {
-            println!(
-                "{}",
-                style.paint(
-                    &fit("A minimal X11 desktop", width),
-                    style.palette.muted,
-                    false
-                )
-            );
-        }
-        println!("{}", style.paint(&line, style.palette.border, false));
-        println!();
-        println!(
-            "{}",
-            style.paint(
-                &fit(&format!("{}@{}", username(), hostname()), width),
-                style.palette.accent,
-                true
-            )
-        );
-        println!();
-        for (index, (label, value)) in info.iter().enumerate() {
-            if label == "Memory" && index > 0 {
-                println!();
-            }
-            let label = match label.as_str() {
-                "Terminal" if label_width == 5 => "Term",
-                "Kernel" if label_width == 5 => "Kern",
-                "Memory" if label_width == 5 => "Mem",
-                "Uptime" if label_width == 5 => "Up",
-                "Theme" if label_width == 5 => "Theme",
-                other => other,
-            };
-            let display = match info[index].0.as_str() {
-                "OS" if !full => value.replace("Debian GNU/Linux", "Debian"),
-                "CPU" if !full => short_cpu(value),
-                _ => value.clone(),
-            };
-            if width <= label_width + gap {
-                println!(
-                    "{}",
-                    style.paint(
-                        &fit(&format!("{label} {display}"), width),
-                        style.palette.foreground,
-                        false
-                    )
-                );
-                continue;
-            }
-            let display = if full {
-                display
-            } else {
-                fit(&display, value_width)
-            };
-            println!(
-                "{}  {}",
-                style.paint(
-                    &format!("{label:<label_width$}"),
-                    style.palette.muted,
-                    false
-                ),
-                style.paint(&display, style.palette.foreground, false)
-            );
-        }
-        if !plain && !compact && width >= 20 {
-            println!();
-            println!("{}", style.paint(&line, style.palette.border, false));
+        let title = format!("{}@{}", username(), hostname());
+        for line in default_lines(&title, &info, &style, layout, terminal_width()) {
+            println!("{line}");
         }
         return;
     }
@@ -908,9 +1003,94 @@ mod tests {
     }
 
     #[test]
-    fn cpu_shortening_removes_trademark_and_frequency() {
-        let short = short_cpu("11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz");
-        assert_eq!(short, "11th Gen Intel Core i7-1165G7");
+    fn cpu_shortening_removes_vendor_noise() {
+        for (raw, short) in [
+            (
+                "11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz",
+                "11th Gen Intel Core i7-1165G7",
+            ),
+            ("Intel(R) Xeon(R) W-1250 CPU @ 3.30GHz", "Intel Xeon W-1250"),
+            (
+                "AMD Ryzen AI 9 HX PRO 375 w/ Radeon 890M",
+                "AMD Ryzen AI 9 HX PRO 375",
+            ),
+            (
+                "AMD Ryzen 7 5800H with Radeon Graphics",
+                "AMD Ryzen 7 5800H",
+            ),
+            ("AMD Ryzen 9 7950X 16-Core Processor", "AMD Ryzen 9 7950X"),
+            ("AMD FX(tm)-8350 Eight-Core Processor", "AMD FX-8350"),
+            ("AMD EPYC 7763 64-Core Processor", "AMD EPYC 7763"),
+            ("Intel(R) Core(TM) Ultra 7 155H", "Intel Core Ultra 7 155H"),
+            (
+                "Intel(R) Core(TM)2 Duo CPU     T7700  @ 2.40GHz",
+                "Intel Core2 Duo T7700",
+            ),
+            (
+                "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+                "Intel Xeon E5-2680 v4",
+            ),
+            (
+                "12th Gen Intel(R) Core(TM) i7-1260P",
+                "12th Gen Intel Core i7-1260P",
+            ),
+            (
+                "Intel(R) Celeron(R) N4020 CPU @ 1.10GHz",
+                "Intel Celeron N4020",
+            ),
+            ("Apple M2", "Apple M2"),
+        ] {
+            assert_eq!(short_cpu(raw), short, "{raw}");
+        }
+    }
+
+    #[test]
+    fn cpu_counts_cores_and_threads() {
+        let fixture = Fixture::new("cpuinfo");
+        let mut text = String::new();
+        // 1 package, 2 cores, 2 threads each.
+        for (processor, core) in [(0, 0), (1, 1), (2, 0), (3, 1)] {
+            text.push_str(&format!(
+                "processor\t: {processor}\nmodel name\t: AMD Ryzen AI 9 HX PRO 375 w/ Radeon 890M\nphysical id\t: 0\ncore id\t\t: {core}\ncpu cores\t: 2\n\n"
+            ));
+        }
+        fixture.write("/proc/cpuinfo", &text);
+        let cpu = cpu_info(&fixture.sys());
+        assert_eq!((cpu.cores, cpu.threads), (Some(2), Some(4)));
+        assert_eq!(cpu.display(false), "AMD Ryzen AI 9 HX PRO 375 (2C/4T)");
+        assert_eq!(
+            cpu.display(true),
+            "AMD Ryzen AI 9 HX PRO 375 w/ Radeon 890M (2C/4T)"
+        );
+        // ARM-style cpuinfo without topology ids.
+        fixture.write(
+            "/proc/cpuinfo",
+            "processor\t: 0\nBogoMIPS\t: 1\n\nprocessor\t: 1\n\nModel\t: Raspberry Pi 4 Model B\n",
+        );
+        let cpu = cpu_info(&fixture.sys());
+        assert_eq!(cpu.display(false), "Raspberry Pi 4 Model B (2T)");
+        // Missing file.
+        let empty = Fixture::new("cpuinfo-empty");
+        assert_eq!(cpu_info(&empty.sys()).display(false), "CPU");
+    }
+
+    #[test]
+    fn values_use_the_terminal_width_before_cutting() {
+        let style = Style {
+            colour: false,
+            palette: Palette::default(),
+        };
+        let cpu = "AMD Ryzen AI 9 HX PRO 375 (12C/24T)".to_string();
+        let info = vec![("CPU".to_string(), cpu.clone())];
+        let layout = Layout::default();
+        let wide = default_lines("u@h", &info, &style, layout, Some(80));
+        assert!(wide.iter().any(|line| line.ends_with(&cpu)), "{wide:?}");
+        assert!(wide.iter().all(|line| line.chars().count() <= 80));
+        let narrow = default_lines("u@h", &info, &style, layout, Some(30));
+        assert!(narrow.iter().all(|line| line.chars().count() <= 30));
+        assert!(narrow.iter().any(|line| line.ends_with('…')));
+        let unknown = default_lines("u@h", &info, &style, layout, None);
+        assert!(unknown.iter().any(|line| line.ends_with(&cpu)));
     }
 
     /// A throw-away fixture root under the temp dir, removed on drop.
