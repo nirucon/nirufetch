@@ -843,8 +843,8 @@ struct Layout {
 
 /// The default (and `--compact`/`--full`) layout. The header and rules stay
 /// within 44 columns; values use the rest of the terminal width and are cut
-/// only when they still do not fit. `width` is `None` when it is unknown (not
-/// a terminal), and then nothing is cut.
+/// only when they still do not fit (`--full` wraps them instead). `width` is
+/// `None` when it is unknown (not a terminal), and then nothing is cut.
 fn default_lines(
     title: &str,
     info: &[(String, String)],
@@ -859,6 +859,8 @@ fn default_lines(
     } else {
         available.min(44)
     };
+    // --full wraps a value; with an unknown width there is nothing to wrap to.
+    let full_wrap = layout.full && width.is_some();
     let label_width = if layout.compact || rule_width < 30 {
         5
     } else {
@@ -907,20 +909,25 @@ fn default_lines(
             ));
             continue;
         }
-        let display = if layout.full {
-            display
+        let pieces = if full_wrap {
+            wrap(&display, value_width)
+        } else if layout.full {
+            vec![display]
         } else {
-            fit(&display, value_width)
+            vec![fit(&display, value_width)]
         };
-        out.push(format!(
-            "{}  {}",
-            style.paint(
-                &format!("{label:<label_width$}"),
-                style.palette.muted,
-                false
-            ),
-            style.paint(&display, style.palette.foreground, false)
-        ));
+        for (index, piece) in pieces.iter().enumerate() {
+            let label = if index == 0 { label } else { "" };
+            out.push(format!(
+                "{}  {}",
+                style.paint(
+                    &format!("{label:<label_width$}"),
+                    style.palette.muted,
+                    false
+                ),
+                style.paint(piece, style.palette.foreground, false)
+            ));
+        }
     }
     if !layout.plain && !layout.compact && rule_width >= 20 {
         out.push(String::new());
@@ -1289,6 +1296,8 @@ fn main() {
             &rows,
             &style,
             !flag("--no-logo") && !flag("--plain"),
+            full,
+            terminal_width(),
         )
     } else {
         let layout = Layout {
@@ -1303,16 +1312,26 @@ fn main() {
     }
 }
 
+/// Below this width `--classic` drops the logo by itself.
+const CLASSIC_LOGO_MIN_WIDTH: usize = 60;
+
+/// The `--classic` layout: the logo (when it fits) beside aligned
+/// `label │ value` rows. Values are cut to the width, or wrapped with
+/// `--full`; `width` is `None` when unknown.
 fn classic_lines(
     title: &str,
     info: &[(String, String)],
     style: &Style,
     show_logo: bool,
+    full: bool,
+    width: Option<usize>,
 ) -> Vec<String> {
+    let available = width.unwrap_or(usize::MAX).max(1);
+    let show_logo = show_logo && available >= CLASSIC_LOGO_MIN_WIDTH;
     let mut out = vec![
-        style.paint(title, style.palette.accent, true),
+        style.paint(&fit(title, available), style.palette.accent, true),
         style.paint(
-            &"─".repeat(title.chars().count()),
+            &"─".repeat(title.chars().count().min(available)),
             style.palette.border,
             false,
         ),
@@ -1329,10 +1348,42 @@ fn classic_lines(
         .map(|(label, _)| label.chars().count())
         .max()
         .unwrap_or(0);
+    let prefix = if show_logo { logo_width + 2 } else { 0 };
+    // "label │ value"
+    let value_width = available.saturating_sub(prefix + label_width + 3);
+    let mut right = Vec::new();
+    for (label, value) in info {
+        if value_width == 0 {
+            right.push(style.paint(
+                &fit(&format!("{label} {value}"), available),
+                style.palette.foreground,
+                false,
+            ));
+            continue;
+        }
+        let pieces = if full {
+            wrap(value, value_width)
+        } else {
+            vec![fit(value, value_width)]
+        };
+        for (index, piece) in pieces.iter().enumerate() {
+            let label = if index == 0 { label.as_str() } else { "" };
+            right.push(format!(
+                "{} {} {}",
+                style.paint(
+                    &format!("{label:<label_width$}"),
+                    style.palette.muted,
+                    false
+                ),
+                style.paint("│", style.palette.border, false),
+                style.paint(piece, style.palette.foreground, false)
+            ));
+        }
+    }
     let rows = if show_logo {
-        logo.len().max(info.len())
+        logo.len().max(right.len())
     } else {
-        info.len()
+        right.len()
     };
     for index in 0..rows {
         let left = if show_logo && index < logo.len() {
@@ -1341,25 +1392,49 @@ fn classic_lines(
         } else {
             " ".repeat(logo_width)
         };
-        let right = info.get(index).map(|(label, value)| {
-            format!(
-                "{} {} {}",
-                style.paint(
-                    &format!("{label:<label_width$}"),
-                    style.palette.muted,
-                    false
-                ),
-                style.paint("│", style.palette.border, false),
-                style.paint(value, style.palette.foreground, false)
-            )
-        });
-        out.push(match right {
+        out.push(match right.get(index) {
             Some(right) if show_logo => format!("{left}  {right}"),
-            Some(right) => right,
+            Some(right) => right.clone(),
             None => left,
         });
     }
     out
+}
+
+/// Word-wrap `value` into lines of at most `width` characters, breaking
+/// words that are longer than a line.
+fn wrap(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in value.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let used = line.chars().count();
+            let gap = usize::from(used > 0);
+            if used + gap + word.len() <= width {
+                if gap == 1 {
+                    line.push(' ');
+                }
+                line.extend(word.iter());
+                break;
+            }
+            if used > 0 {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            let rest = word.split_off(width);
+            lines.push(word.iter().collect());
+            word = rest;
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1798,7 +1873,7 @@ pub(crate) mod tests {
         style.palette.accent = (1, 2, 3);
         let accent = "38;2;1;2;3m";
         let info = vec![("OS".to_string(), "Debian".to_string())];
-        let classic = classic_lines("u@h", &info, &style, true);
+        let classic = classic_lines("u@h", &info, &style, true, false, Some(80));
         assert!(classic[0].contains(accent), "title");
         assert!(classic[3].contains(accent), "logo");
         let compact = Layout {
@@ -1807,6 +1882,84 @@ pub(crate) mod tests {
         };
         let lines = default_lines("u@h", &info, &style, compact, Some(80));
         assert!(lines[0].contains(accent));
+    }
+
+    fn width_of(line: &str) -> usize {
+        line.chars().count()
+    }
+
+    #[test]
+    fn narrow_terminals_fit_every_mode() {
+        let style = Style::plain();
+        let info = rows(&sample_info(), true);
+        let long = "AMD Ryzen AI 9 HX PRO 375 w/ Radeon 890M (12C/24T) and then some more words";
+        let mut info = info;
+        info.push(("CPU".into(), long.into()));
+        let has_logo = |lines: &[String]| lines.iter().any(|line| line.contains('█'));
+        for width in [40, 60, 120] {
+            for full in [false, true] {
+                let layouts = [
+                    Layout {
+                        full,
+                        ..Layout::default()
+                    },
+                    Layout {
+                        full,
+                        compact: true,
+                        ..Layout::default()
+                    },
+                    Layout {
+                        full,
+                        plain: true,
+                        ..Layout::default()
+                    },
+                ];
+                for layout in layouts {
+                    let lines = default_lines("niru@othala", &info, &style, layout, Some(width));
+                    for line in &lines {
+                        assert!(width_of(line) <= width, "{width} {line:?}");
+                    }
+                    if full {
+                        // Wrapped, not cut: every word survives.
+                        let text = lines.join(" ");
+                        assert!(long.split(' ').all(|word| text.contains(word)));
+                        assert!(!text.contains('…'), "{width}: {lines:#?}");
+                    }
+                }
+                let classic = classic_lines("niru@othala", &info, &style, true, full, Some(width));
+                for line in &classic {
+                    assert!(width_of(line) <= width, "classic {width} {line:?}");
+                }
+                assert_eq!(has_logo(&classic), width >= 60, "logo at {width}");
+                // Every value row keeps its separator in one straight column.
+                let columns = separator_columns(&classic);
+                assert!(columns.windows(2).all(|pair| pair[0] == pair[1]));
+            }
+        }
+        // Extremely narrow terminals still never exceed the width.
+        for width in [1, 5, 12, 20] {
+            for line in default_lines("niru@othala", &info, &style, Layout::default(), Some(width))
+                .iter()
+                .chain(&classic_lines(
+                    "niru@othala",
+                    &info,
+                    &style,
+                    true,
+                    true,
+                    Some(width),
+                ))
+            {
+                assert!(width_of(line) <= width, "{width} {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_words_and_long_words() {
+        assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap("", 3), [""]);
+        assert_eq!(wrap("ab  cd", 10), ["ab cd"]);
     }
 
     fn separator_columns(lines: &[String]) -> Vec<usize> {
@@ -1829,7 +1982,8 @@ pub(crate) mod tests {
         .map(|(l, v)| (l.to_string(), v.to_string()))
         .collect();
         for show_logo in [true, false] {
-            let columns = separator_columns(&classic_lines("u@h", &info, &style, show_logo));
+            let columns =
+                separator_columns(&classic_lines("u@h", &info, &style, show_logo, false, None));
             assert_eq!(columns.len(), info.len());
             assert!(
                 columns.windows(2).all(|pair| pair[0] == pair[1]),
