@@ -449,22 +449,40 @@ fn main() {
         return;
     }
 
-    let title = format!("{}@{}", username(), hostname());
-    println!("{}", style.paint(&title, style.palette.accent, true));
-    println!(
-        "{}",
+    for line in classic_lines(
+        &format!("{}@{}", username(), hostname()),
+        &info,
+        &style,
+        show_logo,
+    ) {
+        println!("{line}");
+    }
+}
+
+fn classic_lines(
+    title: &str,
+    info: &[(String, String)],
+    style: &Style,
+    show_logo: bool,
+) -> Vec<String> {
+    let mut out = vec![
+        style.paint(title, style.palette.accent, true),
         style.paint(
             &"─".repeat(title.chars().count()),
             style.palette.border,
-            false
-        )
-    );
-    println!();
-
+            false,
+        ),
+        String::new(),
+    ];
     let logo = logo();
     let logo_width = logo
         .iter()
         .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = info
+        .iter()
+        .map(|(label, _)| label.chars().count())
         .max()
         .unwrap_or(0);
     let rows = if show_logo {
@@ -482,17 +500,22 @@ fn main() {
         let right = info.get(index).map(|(label, value)| {
             format!(
                 "{} {} {}",
-                style.paint(label, style.palette.muted, false),
+                style.paint(
+                    &format!("{label:<label_width$}"),
+                    style.palette.muted,
+                    false
+                ),
                 style.paint("│", style.palette.border, false),
                 style.paint(value, style.palette.foreground, false)
             )
         });
-        match right {
-            Some(right) if show_logo => println!("{left}  {right}"),
-            Some(right) => println!("{right}"),
-            None => println!("{left}"),
-        }
+        out.push(match right {
+            Some(right) if show_logo => format!("{left}  {right}"),
+            Some(right) => right,
+            None => left,
+        });
     }
+    out
 }
 
 #[cfg(test)]
@@ -523,5 +546,37 @@ mod tests {
     fn cpu_shortening_removes_trademark_and_frequency() {
         let short = short_cpu("11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz");
         assert_eq!(short, "11th Gen Intel Core i7-1165G7");
+    }
+
+    fn separator_columns(lines: &[String]) -> Vec<usize> {
+        lines
+            .iter()
+            .filter_map(|line| line.chars().position(|c| c == '│'))
+            .collect()
+    }
+
+    #[test]
+    fn classic_separators_form_a_straight_column() {
+        let style = Style {
+            colour: false,
+            palette: Palette::default(),
+        };
+        let info: Vec<(String, String)> = [
+            ("OS", "Debian"),
+            ("Kernel", "6.12"),
+            ("Terminal", "kitty"),
+            ("WM", "NIRUWM"),
+        ]
+        .iter()
+        .map(|(l, v)| (l.to_string(), v.to_string()))
+        .collect();
+        for show_logo in [true, false] {
+            let columns = separator_columns(&classic_lines("u@h", &info, &style, show_logo));
+            assert_eq!(columns.len(), info.len());
+            assert!(
+                columns.windows(2).all(|pair| pair[0] == pair[1]),
+                "{columns:?}"
+            );
+        }
     }
 }
