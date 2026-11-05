@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-VERSION="0.1.4"
+VERSION="0.2.0"
 REPO="${NIRUFETCH_REPO:-nirucon/nirufetch}"
 PREFIX="${NIRUFETCH_PREFIX:-${NIRU_PREFIX:-$HOME/.local}}"
 BIN="$PREFIX/bin"
