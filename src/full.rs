@@ -112,62 +112,44 @@ pub fn gpus(sys: &Sys) -> Vec<Gpu> {
     gpus
 }
 
-/// Resolve PCI ids with one streaming pass over pci.ids. The file is sorted
-/// by vendor id, so the scan stops after the highest vendor asked for.
+/// Resolve PCI ids from pci.ids. Each vendor's block is found with one
+/// substring search for its `\nvvvv  ` line, and only that block's device
+/// lines are parsed, so the rest of the file is never split into lines.
 pub fn pci_names(sys: &Sys, wanted: &[(u16, u16)]) -> Vec<Option<String>> {
     let mut found: Vec<Option<String>> = vec![None; wanted.len()];
-    let Some(bytes) = ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"]
+    let Some(text) = ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"]
         .iter()
         .find_map(|path| fs::read(sys.path(path)).ok())
+        .map(utf8)
     else {
         return found;
     };
-    let last_vendor = wanted.iter().map(|(vendor, _)| *vendor).max().unwrap_or(0);
-    let mut vendor: Option<(u16, String)> = None;
-    for raw in bytes.split(|&b| b == b'\n') {
-        // Device lines of vendors nobody asked for are most of the file.
-        if vendor.is_none() && matches!(raw.first(), Some(b'\t' | b'#')) {
+    for (index, &(vendor_id, device_id)) in wanted.iter().enumerate() {
+        let needle = format!("\n{vendor_id:04x}  ");
+        let Some(start) = text.find(&needle) else {
             continue;
-        }
-        let line = String::from_utf8_lossy(raw);
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line.starts_with('#') {
+        };
+        let mut lines = text[start + 1..].lines();
+        let Some(vendor_name) = lines.next().and_then(|line| line.get(6..)) else {
             continue;
-        }
-        if let Some(rest) = line.strip_prefix('\t') {
-            if rest.starts_with('\t') {
-                continue; // subsystem line
-            }
-            let Some((vendor_id, vendor_name)) = &vendor else {
+        };
+        for line in lines {
+            if line.starts_with('#') || line.is_empty() {
                 continue;
+            }
+            let Some(rest) = line.strip_prefix('\t') else {
+                break; // the next vendor
             };
+            if rest.starts_with('\t') {
+                continue; // a subsystem line
+            }
             let Some((id, name)) = rest.split_once("  ") else {
                 continue;
             };
-            let Some(device_id) = parse_hex_id(id) else {
-                continue;
-            };
-            for (slot, (want_vendor, want_device)) in found.iter_mut().zip(wanted) {
-                if want_vendor == vendor_id && *want_device == device_id {
-                    *slot = Some(gpu_name(*vendor_id, vendor_name, name.trim()));
-                }
+            if parse_hex_id(id) == Some(device_id) {
+                found[index] = Some(gpu_name(vendor_id, vendor_name.trim(), name.trim()));
+                break;
             }
-            continue;
-        }
-        // A vendor line ("8086  Intel Corporation") or the class section ("C ").
-        let parsed = line
-            .split_once("  ")
-            .and_then(|(id, name)| Some((parse_hex_id(id)?, name)));
-        match parsed {
-            Some((id, _)) if id > last_vendor => break,
-            Some((id, name)) if wanted.iter().any(|(v, _)| *v == id) => {
-                vendor = Some((id, name.trim().to_string()));
-            }
-            Some(_) => vendor = None,
-            None => break,
-        }
-        if found.iter().all(Option::is_some) {
-            break;
         }
     }
     found
@@ -261,13 +243,20 @@ pub fn batteries(sys: &Sys) -> Vec<Battery> {
         .collect()
 }
 
+/// Bytes as text without copying when they are valid UTF-8 (the fast,
+/// normal case), so line splitting can use the optimised `str::lines`.
+fn utf8(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
 /// Count lines (trimmed) that match, given the previous line too.
-fn count_lines(path: &Path, matches: impl Fn(&[u8], &[u8]) -> bool) -> Option<usize> {
-    let bytes = fs::read(path).ok()?;
-    let mut previous: &[u8] = b"";
+fn count_lines(path: &Path, matches: impl Fn(&str, &str) -> bool) -> Option<usize> {
+    let text = utf8(fs::read(path).ok()?);
+    let mut previous = "";
     let mut count = 0;
-    for line in bytes.split(|&b| b == b'\n') {
-        let line = line.trim_ascii();
+    for line in text.lines() {
+        let line = line.trim();
         if matches(previous, line) {
             count += 1;
         }
@@ -280,10 +269,23 @@ fn count_lines(path: &Path, matches: impl Fn(&[u8], &[u8]) -> bool) -> Option<us
 /// dpkg `status`, the pacman `local/` directory and the xbps `pkgdb`.
 pub fn packages(sys: &Sys) -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
-    if let Some(count) = count_lines(&sys.path("/var/lib/dpkg/status"), |_, line| {
-        line.starts_with(b"Status: ") && line.ends_with(b" installed")
-    }) {
-        out.push(("dpkg", count));
+    if let Ok(bytes) = fs::read(sys.path("/var/lib/dpkg/status")) {
+        // Find the Status fields by substring search instead of splitting
+        // every line of a multi-megabyte file.
+        let text = utf8(bytes);
+        let installed = |line: &str| {
+            let line = line.lines().next().unwrap_or_default();
+            line.trim_end().ends_with(" installed")
+        };
+        let first = text
+            .strip_prefix("Status: ")
+            .map(|rest| installed(rest) as usize)
+            .unwrap_or(0);
+        let rest = text
+            .match_indices("\nStatus: ")
+            .filter(|(at, needle)| installed(&text[at + needle.len()..]))
+            .count();
+        out.push(("dpkg", first + rest));
     }
     if let Ok(dir) = fs::read_dir(sys.path("/var/lib/pacman/local")) {
         let count = dir
@@ -306,7 +308,7 @@ pub fn packages(sys: &Sys) -> Vec<(&'static str, usize)> {
         pkgdb.sort();
         if let Some(path) = pkgdb.last() {
             if let Some(count) = count_lines(path, |previous, line| {
-                previous == b"<key>state</key>" && line == b"<string>installed</string>"
+                previous == "<key>state</key>" && line == "<string>installed</string>"
             }) {
                 out.push(("xbps", count));
             }
@@ -550,6 +552,12 @@ C 00  Unclassified device
         assert_eq!(found, [("dpkg", 2), ("pacman", 2), ("xbps", 2)]);
         assert_eq!(packages_display(&found), "2 (dpkg), 2 (pacman), 2 (xbps)");
         assert!(packages(&Fixture::new("packages-none").sys()).is_empty());
+        let first = Fixture::new("packages-first");
+        first.write(
+            "/var/lib/dpkg/status",
+            "Status: install ok installed\nPackage: a\n\nPackage: b\nStatus: install ok installed\r\n",
+        );
+        assert_eq!(packages(&first.sys()), [("dpkg", 2)]);
     }
 
     #[test]
