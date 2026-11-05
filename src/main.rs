@@ -53,21 +53,131 @@ impl Default for Palette {
     }
 }
 
+/// How many colours the terminal can show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Depth {
+    TrueColor,
+    Ansi256,
+    Ansi16,
+}
+
+/// Truecolor when `COLORTERM` says so (or the terminal is one that always
+/// supports it), 256 colours for `*256color` terminals, else the 16 ANSI
+/// colours.
+fn colour_depth(colorterm: Option<&str>, term: Option<&str>) -> Depth {
+    let colorterm = colorterm.unwrap_or_default().to_ascii_lowercase();
+    if colorterm == "truecolor" || colorterm == "24bit" {
+        return Depth::TrueColor;
+    }
+    let term = term.unwrap_or_default();
+    let truecolor_terms = [
+        "xterm-kitty",
+        "alacritty",
+        "foot",
+        "foot-extra",
+        "wezterm",
+        "xterm-ghostty",
+        "contour",
+    ];
+    if truecolor_terms.contains(&term) || term.ends_with("-direct") {
+        Depth::TrueColor
+    } else if term.contains("256color") {
+        Depth::Ansi256
+    } else {
+        Depth::Ansi16
+    }
+}
+
+/// The nearest xterm 256-colour index (6×6×6 cube or grey ramp).
+fn ansi256(rgb: Rgb) -> u8 {
+    let (r, g, b) = rgb;
+    let level = |v: u8| -> u8 {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    };
+    let steps = [0u8, 95, 135, 175, 215, 255];
+    let (lr, lg, lb) = (level(r), level(g), level(b));
+    let cube = (steps[lr as usize], steps[lg as usize], steps[lb as usize]);
+    let average = (r as u32 + g as u32 + b as u32) / 3;
+    let grey_index = if average > 238 {
+        23
+    } else {
+        (average.saturating_sub(3) / 10).min(23)
+    } as u8;
+    let grey = 8 + grey_index * 10;
+    if distance(rgb, (grey, grey, grey)) < distance(rgb, cube) {
+        232 + grey_index
+    } else {
+        16 + 36 * lr + 6 * lg + lb
+    }
+}
+
+fn distance(a: Rgb, b: Rgb) -> u32 {
+    let d = |x: u8, y: u8| (x as i32 - y as i32).unsigned_abs().pow(2);
+    d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
+}
+
+/// An ANSI 16-colour SGR code for a theme colour: greys by lightness,
+/// otherwise the hue's primary/secondary colour, bright when it is light.
+/// (Nearest-distance matching would turn most muted theme colours grey.)
+/// Plain black is never used, because the terminal's own background is
+/// unknown and a dark border would vanish on a black one.
+fn ansi16(rgb: Rgb) -> u8 {
+    let (r, g, b) = rgb;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max - min < 40 {
+        return match max {
+            0..=159 => 90,
+            160..=219 => 37,
+            _ => 97,
+        };
+    }
+    let middle = (max as u16 + min as u16) / 2;
+    let on = |v: u8| (v as u16 > middle) as u8;
+    let hue = on(r) | (on(g) << 1) | (on(b) << 2);
+    if max > 200 {
+        90 + hue
+    } else {
+        30 + hue
+    }
+}
+
 struct Style {
     colour: bool,
+    depth: Depth,
     palette: Palette,
 }
 
 impl Style {
-    fn paint(&self, text: &str, rgb: (u8, u8, u8), bold: bool) -> String {
+    #[cfg(test)]
+    fn plain() -> Self {
+        Self {
+            colour: false,
+            depth: Depth::TrueColor,
+            palette: Palette::default(),
+        }
+    }
+
+    fn paint(&self, text: &str, rgb: Rgb, bold: bool) -> String {
         if !self.colour {
             return text.to_string();
         }
         let (r, g, b) = rgb;
+        let colour = match self.depth {
+            Depth::TrueColor => format!("38;2;{r};{g};{b}"),
+            Depth::Ansi256 => format!("38;5;{}", ansi256(rgb)),
+            Depth::Ansi16 => ansi16(rgb).to_string(),
+        };
         if bold {
-            format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
+            format!("\x1b[1;{colour}m{text}\x1b[0m")
         } else {
-            format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+            format!("\x1b[{colour}m{text}\x1b[0m")
         }
     }
 }
@@ -1159,6 +1269,10 @@ fn main() {
             && !flag("--no-color")
             && !flag("--plain")
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true),
+        depth: colour_depth(
+            env::var("COLORTERM").ok().as_deref(),
+            env::var("TERM").ok().as_deref(),
+        ),
         palette: theme.palette,
     };
     let sys = Sys::from_env();
@@ -1354,10 +1468,7 @@ pub(crate) mod tests {
 
     #[test]
     fn values_use_the_terminal_width_before_cutting() {
-        let style = Style {
-            colour: false,
-            palette: Palette::default(),
-        };
+        let style = Style::plain();
         let cpu = "AMD Ryzen AI 9 HX PRO 375 (12C/24T)".to_string();
         let info = vec![("CPU".to_string(), cpu.clone())];
         let layout = Layout::default();
@@ -1640,6 +1751,64 @@ pub(crate) mod tests {
         assert_eq!(theme.unwrap().1, "Forest Vigil (niru-forest-vigil)");
     }
 
+    #[test]
+    fn colours_fall_back_from_truecolor() {
+        assert_eq!(
+            colour_depth(Some("truecolor"), Some("xterm")),
+            Depth::TrueColor
+        );
+        assert_eq!(colour_depth(Some("24bit"), None), Depth::TrueColor);
+        assert_eq!(colour_depth(None, Some("xterm-kitty")), Depth::TrueColor);
+        assert_eq!(colour_depth(None, Some("xterm-256color")), Depth::Ansi256);
+        assert_eq!(
+            colour_depth(Some(""), Some("tmux-256color")),
+            Depth::Ansi256
+        );
+        assert_eq!(colour_depth(None, Some("xterm")), Depth::Ansi16);
+        assert_eq!(colour_depth(None, Some("linux")), Depth::Ansi16);
+        assert_eq!(ansi256((0, 0, 0)), 16);
+        assert_eq!(ansi256((255, 255, 255)), 231);
+        assert_eq!(ansi256((0x88, 0xc0, 0xd0)), 110);
+        assert_eq!(ansi256((0x80, 0x80, 0x80)), 244);
+        assert_eq!(ansi16((0xc9, 0x60, 0x50)), 91); // Blood of Urdr: bright red
+        assert_eq!(ansi16((0x88, 0xc0, 0xd0)), 96); // Nord: bright cyan
+        assert_eq!(ansi16((0x8a, 0xa8, 0x7e)), 32); // Forest Vigil: green
+        assert_eq!(ansi16((0xa6, 0x3d, 0x2f)), 31); // Carl Larsson: red
+        assert_eq!(ansi16((0xe5, 0xe5, 0xe5)), 97);
+        assert_eq!(ansi16((0x96, 0xa2, 0x92)), 37);
+        assert_eq!(ansi16((0x5a, 0x5a, 0x60)), 90);
+        assert_eq!(ansi16((0x2a, 0x2a, 0x2d)), 90);
+        let mut style = Style::plain();
+        style.colour = true;
+        let accent = (0x8a, 0xa8, 0x7e);
+        assert_eq!(
+            style.paint("x", accent, true),
+            "\x1b[1;38;2;138;168;126mx\x1b[0m"
+        );
+        style.depth = Depth::Ansi256;
+        assert!(style.paint("x", accent, false).starts_with("\x1b[38;5;"));
+        style.depth = Depth::Ansi16;
+        assert!(!style.paint("x", accent, false).contains("38;"));
+    }
+
+    #[test]
+    fn every_layout_uses_the_theme_palette() {
+        let mut style = Style::plain();
+        style.colour = true;
+        style.palette.accent = (1, 2, 3);
+        let accent = "38;2;1;2;3m";
+        let info = vec![("OS".to_string(), "Debian".to_string())];
+        let classic = classic_lines("u@h", &info, &style, true);
+        assert!(classic[0].contains(accent), "title");
+        assert!(classic[3].contains(accent), "logo");
+        let compact = Layout {
+            compact: true,
+            ..Layout::default()
+        };
+        let lines = default_lines("u@h", &info, &style, compact, Some(80));
+        assert!(lines[0].contains(accent));
+    }
+
     fn separator_columns(lines: &[String]) -> Vec<usize> {
         lines
             .iter()
@@ -1649,10 +1818,7 @@ pub(crate) mod tests {
 
     #[test]
     fn classic_separators_form_a_straight_column() {
-        let style = Style {
-            colour: false,
-            palette: Palette::default(),
-        };
+        let style = Style::plain();
         let info: Vec<(String, String)> = [
             ("OS", "Debian"),
             ("Kernel", "6.12"),
