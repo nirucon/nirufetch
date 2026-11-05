@@ -301,13 +301,6 @@ fn cpu_model() -> String {
         .unwrap_or_else(|| "CPU".into())
 }
 
-fn component(value: Option<String>, fallback: &str) -> String {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fallback.into())
-}
-
 fn basename(value: &str) -> String {
     Path::new(value)
         .file_name()
@@ -315,79 +308,282 @@ fn basename(value: &str) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-fn theme() -> (String, Palette) {
-    let path = env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".config")
-        })
-        .join("niruwm/config.toml");
-    let name = read(path)
-        .lines()
-        .find_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            (key.trim() == "theme").then(|| value.trim().trim_matches('"').to_string())
-        })
+/// The built-in NIRUWM theme catalog: id, display name and the colours
+/// nirufetch uses (focus/accent, foreground, muted, border). A file of the same
+/// id in `~/.config/niruwm/themes` takes precedence, as it does in NIRUWM.
+type Rgb = (u8, u8, u8);
+const BUILTIN_THEMES: &[(&str, &str, Rgb, Rgb, Rgb, Rgb)] = &[
+    (
+        "niru-noir",
+        "Niru Noir",
+        (0x5a, 0x5a, 0x60),
+        (0xe5, 0xe5, 0xe5),
+        (0xa8, 0xa8, 0xa8),
+        (0x2a, 0x2a, 0x2d),
+    ),
+    (
+        "niru-nord",
+        "Niru Nord",
+        (0x88, 0xc0, 0xd0),
+        (0xec, 0xef, 0xf4),
+        (0x9a, 0xa5, 0xb1),
+        (0x3b, 0x42, 0x52),
+    ),
+    (
+        "niru-satie",
+        "Niru Satie",
+        (0xb0, 0x8d, 0x7d),
+        (0xde, 0xda, 0xd4),
+        (0x8f, 0x8b, 0x86),
+        (0x2a, 0x27, 0x24),
+    ),
+    (
+        "niru-carl-larsson",
+        "Niru Carl Larsson",
+        (0xa6, 0x3d, 0x2f),
+        (0x3b, 0x32, 0x28),
+        (0x7d, 0x6f, 0x5f),
+        (0xd8, 0xcd, 0xbb),
+    ),
+    (
+        "niru-forest-vigil",
+        "Niru Forest Vigil",
+        (0x8a, 0xa8, 0x7e),
+        (0xd8, 0xde, 0xd2),
+        (0x96, 0xa2, 0x92),
+        (0x2b, 0x36, 0x2c),
+    ),
+    (
+        "niru-blood-of-urdr",
+        "Niru Blood of Urdr",
+        (0xc9, 0x60, 0x50),
+        (0xe8, 0xd6, 0xcf),
+        (0xb0, 0x9a, 0x92),
+        (0x3a, 0x1d, 0x1b),
+    ),
+    (
+        "niru-root-and-stone",
+        "Niru Root and Stone",
+        (0xc1, 0x97, 0x68),
+        (0xea, 0xdf, 0xd2),
+        (0xb5, 0xa0, 0x8c),
+        (0x3a, 0x2a, 0x1e),
+    ),
+    (
+        "niru-blue-horizon",
+        "Niru Blue Horizon",
+        (0x86, 0xae, 0xc8),
+        (0xdc, 0xe6, 0xeb),
+        (0x93, 0xa6, 0xb2),
+        (0x24, 0x38, 0x46),
+    ),
+    (
+        "niru-the-norns",
+        "Niru The Norns",
+        (0xc9, 0xc2, 0xb9),
+        (0xec, 0xe9, 0xe4),
+        (0xa6, 0xa1, 0x9b),
+        (0x3b, 0x39, 0x36),
+    ),
+    (
+        "niru-winter-nights",
+        "Niru Winter Nights",
+        (0xd8, 0xc4, 0xaa),
+        (0xea, 0xd9, 0xc3),
+        (0xb9, 0xaa, 0x9a),
+        (0x4e, 0x51, 0x57),
+    ),
+];
+
+struct Theme {
+    id: String,
+    /// The catalog name without the "Niru " prefix, e.g. "Forest Vigil".
+    name: String,
+    palette: Palette,
+}
+
+fn config_dir() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".config"))
+}
+
+/// A top-level `key = value` from a small TOML file: lines before the first
+/// table header, with the value unquoted and a trailing comment removed.
+fn toml_top_level(text: &str, wanted: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != wanted {
+            continue;
+        }
+        let value = value.trim();
+        let value = if let Some(rest) = value.strip_prefix('"') {
+            rest.split('"').next().unwrap_or_default()
+        } else {
+            value.split('#').next().unwrap_or_default().trim()
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn hex_rgb(value: &str) -> Option<Rgb> {
+    let value = value.trim().trim_start_matches('#');
+    if value.len() != 6 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |at: usize| u8::from_str_radix(&value[at..at + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
+fn display_theme_name(name: &str) -> String {
+    name.strip_prefix("Niru ")
+        .unwrap_or(name)
+        .trim()
+        .to_string()
+}
+
+fn theme_in(config: &Path) -> Theme {
+    let id = toml_top_level(&read(config.join("config.toml")), "theme")
+        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "niru-noir".into());
     let mut palette = Palette::default();
-    match name.as_str() {
-        "niru-nord" => {
-            palette.accent = (0x88, 0xc0, 0xd0);
-            palette.foreground = (0xec, 0xef, 0xf4);
-            palette.muted = (0x9a, 0xa5, 0xb1);
-            palette.border = (0x3b, 0x42, 0x52);
-        }
-        "niru-satie" => {
-            palette.accent = (0xb0, 0x8d, 0x7d);
-            palette.foreground = (0xde, 0xda, 0xd4);
-            palette.muted = (0x8f, 0x8b, 0x86);
-            palette.border = (0x2a, 0x27, 0x24);
-        }
-        "niru-carl-larsson" => {
-            palette.accent = (0xa6, 0x3d, 0x2f);
-            palette.foreground = (0x3b, 0x32, 0x28);
-            palette.muted = (0x7d, 0x6f, 0x5f);
-            palette.border = (0xd8, 0xcd, 0xbb);
-        }
-        "niru-forest-vigil" => {
-            palette.accent = (0x8a, 0xa8, 0x7e);
-            palette.foreground = (0xd8, 0xde, 0xd2);
-            palette.muted = (0x96, 0xa2, 0x92);
-            palette.border = (0x2b, 0x36, 0x2c);
-        }
-        "niru-blood-of-urdr" => {
-            palette.accent = (0xc9, 0x60, 0x50);
-            palette.foreground = (0xe8, 0xd6, 0xcf);
-            palette.muted = (0xb0, 0x9a, 0x92);
-            palette.border = (0x3a, 0x1d, 0x1b);
-        }
-        "niru-root-and-stone" => {
-            palette.accent = (0xc1, 0x97, 0x68);
-            palette.foreground = (0xea, 0xdf, 0xd2);
-            palette.muted = (0xb5, 0xa0, 0x8c);
-            palette.border = (0x3a, 0x2a, 0x1e);
-        }
-        "niru-blue-horizon" => {
-            palette.accent = (0x86, 0xae, 0xc8);
-            palette.foreground = (0xdc, 0xe6, 0xeb);
-            palette.muted = (0x93, 0xa6, 0xb2);
-            palette.border = (0x24, 0x38, 0x46);
-        }
-        "niru-the-norns" => {
-            palette.accent = (0xc9, 0xc2, 0xb9);
-            palette.foreground = (0xec, 0xe9, 0xe4);
-            palette.muted = (0xa6, 0xa1, 0x9b);
-            palette.border = (0x3b, 0x39, 0x36);
-        }
-        "niru-winter-nights" => {
-            palette.accent = (0xd8, 0xc4, 0xaa);
-            palette.foreground = (0xea, 0xd9, 0xc3);
-            palette.muted = (0xb9, 0xaa, 0x9a);
-            palette.border = (0x4e, 0x51, 0x57);
-        }
-        _ => {}
+    let mut name = None;
+    if let Some(&(_, builtin, accent, foreground, muted, border)) =
+        BUILTIN_THEMES.iter().find(|entry| entry.0 == id)
+    {
+        palette = Palette {
+            accent,
+            foreground,
+            muted,
+            border,
+        };
+        name = Some(builtin.to_string());
     }
-    (name, palette)
+    // A user theme file overrides the built-in one, field by field. Only plain
+    // ids are looked up, so a config value can never leave the themes folder.
+    if id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        let text = read(config.join("themes").join(format!("{id}.toml")));
+        let colour = |key: &str| toml_top_level(&text, key).and_then(|v| hex_rgb(&v));
+        if let Some(rgb) = colour("focus") {
+            palette.accent = rgb;
+        }
+        if let Some(rgb) = colour("foreground") {
+            palette.foreground = rgb;
+        }
+        if let Some(rgb) = colour("muted") {
+            palette.muted = rgb;
+        }
+        if let Some(rgb) = colour("border") {
+            palette.border = rgb;
+        }
+        if let Some(custom) = toml_top_level(&text, "name").filter(|n| !n.is_empty()) {
+            name = Some(custom);
+        }
+    }
+    Theme {
+        name: display_theme_name(name.as_deref().unwrap_or(&id)),
+        id,
+        palette,
+    }
+}
+
+fn theme() -> Theme {
+    theme_in(&config_dir().join("niruwm"))
+}
+
+/// The installed NIRUX generation, as NIRUX records it: the `manifest` of
+/// `~/.local/share/nirux/current` (`suite X` plus one `component X` line
+/// each). `nirux --version` reports the same suite version.
+#[derive(Default)]
+struct Nirux {
+    suite: Option<String>,
+    components: Vec<(String, String)>,
+}
+
+impl Nirux {
+    fn component(&self, name: &str) -> Option<&str> {
+        self.components
+            .iter()
+            .find(|(component, _)| component == name)
+            .map(|(_, version)| version.as_str())
+    }
+}
+
+fn nirux_state_dir() -> PathBuf {
+    env::var_os("NIRUX_PREFIX")
+        .filter(|prefix| !prefix.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".local"))
+        .join("share/nirux")
+}
+
+fn parse_manifest(text: &str) -> Nirux {
+    let mut nirux = Nirux::default();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(key), Some(value), None) = (words.next(), words.next(), words.next()) else {
+            continue;
+        };
+        match key {
+            "schema" => {}
+            "suite" => nirux.suite = Some(value.to_string()),
+            _ => nirux.components.push((key.to_string(), value.to_string())),
+        }
+    }
+    nirux
+}
+
+/// `VERSION=` near the top of the generation's `nirux` script, which is what
+/// `nirux --version` prints. Only the first lines are read.
+fn script_version(text: &str) -> Option<String> {
+    text.lines()
+        .take(20)
+        .find_map(|line| line.strip_prefix("VERSION="))
+        .map(|value| value.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn nirux_in(state: &Path) -> Nirux {
+    let current = state.join("current");
+    let mut nirux = parse_manifest(&read(current.join("manifest")));
+    if nirux.suite.is_none() {
+        nirux.suite = script_version(&read_head(&current.join("bin/nirux"), 2048));
+    }
+    nirux
+}
+
+fn read_head(path: &Path, bytes: usize) -> String {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    if let Ok(file) = fs::File::open(path) {
+        let _ = file.take(bytes as u64).read_to_end(&mut buffer);
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// NIRUWM with its installed version when this is a NIRU session (or the
+/// desktop is unknown and NIRUX is installed); otherwise the desktop name.
+fn window_manager(desktop: Option<&str>, nirux: &Nirux) -> String {
+    let desktop = desktop.map(str::trim).filter(|d| !d.is_empty());
+    let niru_session = desktop
+        .map(|d| d.to_ascii_uppercase().contains("NIRU"))
+        .unwrap_or(true);
+    match (niru_session, nirux.component("niruwm")) {
+        (true, Some(version)) => format!("NIRUWM {version}"),
+        (true, None) if desktop.is_some() => "NIRUWM".into(),
+        _ => desktop.unwrap_or("unknown").to_string(),
+    }
 }
 
 fn logo() -> [&'static str; 6] {
@@ -452,6 +648,9 @@ fn main() {
         println!("NIRU terminal system fetch. Reads local files; no network or daemon.");
         return;
     }
+    let theme = theme();
+    let nirux = nirux_in(&nirux_state_dir());
+    let full = args.iter().any(|arg| arg == "--full");
     let style = Style {
         colour: io::stdout().is_terminal()
             && env::var_os("NO_COLOR").is_none()
@@ -459,19 +658,19 @@ fn main() {
                 .iter()
                 .any(|arg| arg == "--no-color" || arg == "--plain")
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true),
-        palette: theme().1,
+        palette: theme.palette,
     };
     let classic = args.iter().any(|arg| arg == "--classic");
     let show_logo = classic
         && !args
             .iter()
             .any(|arg| arg == "--no-logo" || arg == "--plain");
-    let (theme_name, _) = theme();
     let sys = Sys::from_env();
     let mem = memory();
     let disk = disk();
     let mut info = vec![
         ("OS".to_string(), os_name()),
+        ("NIRUX".to_string(), nirux.suite.clone().unwrap_or_default()),
         ("Kernel".to_string(), kernel()),
         ("Uptime".to_string(), format_uptime(uptime_seconds())),
         (
@@ -480,7 +679,7 @@ fn main() {
         ),
         (
             "WM".to_string(),
-            component(env::var("XDG_CURRENT_DESKTOP").ok(), "unknown"),
+            window_manager(env::var("XDG_CURRENT_DESKTOP").ok().as_deref(), &nirux),
         ),
         ("Terminal".to_string(), terminal(&sys)),
         ("CPU".to_string(), cpu_model()),
@@ -508,13 +707,19 @@ fn main() {
             })
             .unwrap_or_else(|| "unknown".into()),
         ),
-        ("Theme".to_string(), theme_name),
+        (
+            "Theme".to_string(),
+            if full {
+                format!("{} ({})", theme.name, theme.id)
+            } else {
+                theme.name.clone()
+            },
+        ),
     ];
     info.retain(|(_, value)| !value.is_empty());
 
     if !classic {
         let plain = args.iter().any(|arg| arg == "--plain");
-        let full = args.iter().any(|arg| arg == "--full");
         let compact = args.iter().any(|arg| arg == "--compact");
         let width = if full {
             terminal_width()
@@ -552,7 +757,7 @@ fn main() {
         );
         println!();
         for (index, (label, value)) in info.iter().enumerate() {
-            if index == 7 {
+            if label == "Memory" && index > 0 {
                 println!();
             }
             let label = match label.as_str() {
@@ -786,6 +991,80 @@ mod tests {
         assert_eq!(terminal_from_env(None, None), "tty");
         assert_eq!(terminal_from_env(None, Some("linux")), "Linux console");
         assert_eq!(terminal_from_env(None, Some("screen")), "screen");
+    }
+
+    #[test]
+    fn manifest_gives_suite_and_component_versions() {
+        let fixture = Fixture::new("manifest");
+        fixture.write(
+            "current/manifest",
+            "schema 1\nsuite 0.12.205\nniruwm 0.16.172\nnirubar 0.18.84\nbroken line here\n",
+        );
+        let nirux = nirux_in(&fixture.root);
+        assert_eq!(nirux.suite.as_deref(), Some("0.12.205"));
+        assert_eq!(nirux.component("niruwm"), Some("0.16.172"));
+        assert_eq!(nirux.component("nirufetch"), None);
+        assert_eq!(window_manager(Some("NIRU"), &nirux), "NIRUWM 0.16.172");
+        assert_eq!(window_manager(None, &nirux), "NIRUWM 0.16.172");
+        assert_eq!(window_manager(Some("GNOME"), &nirux), "GNOME");
+        let none = Nirux::default();
+        assert_eq!(window_manager(Some("NIRU"), &none), "NIRUWM");
+        assert_eq!(window_manager(None, &none), "unknown");
+        // Without a suite line, fall back to the script's VERSION= line.
+        fixture.write("current/manifest", "schema 1\nniruwm 0.16.172\n");
+        fixture.write(
+            "current/bin/nirux",
+            "#!/bin/sh\nset -eu\n\nVERSION=0.12.205\nPREFIX=x\n",
+        );
+        assert_eq!(nirux_in(&fixture.root).suite.as_deref(), Some("0.12.205"));
+        // Nothing installed: no NIRUX row.
+        let empty = Fixture::new("manifest-empty");
+        assert_eq!(nirux_in(&empty.root).suite, None);
+    }
+
+    #[test]
+    fn theme_uses_catalog_names_and_user_files() {
+        let fixture = Fixture::new("theme");
+        let config = fixture.root.join("niruwm");
+        // Default when nothing is configured.
+        let theme = theme_in(&config);
+        assert_eq!(
+            (theme.id.as_str(), theme.name.as_str()),
+            ("niru-noir", "Noir")
+        );
+        // A built-in theme, with a comment and a later table using `theme`.
+        fixture.write(
+            "niruwm/config.toml",
+            "# x\ntheme = \"niru-forest-vigil\" # mine\n[other]\ntheme = \"nope\"\n",
+        );
+        let theme = theme_in(&config);
+        assert_eq!(theme.id, "niru-forest-vigil");
+        assert_eq!(theme.name, "Forest Vigil");
+        assert_eq!(theme.palette.accent, (0x8a, 0xa8, 0x7e));
+        // A user file overrides the built-in palette and name.
+        fixture.write(
+            "niruwm/themes/niru-forest-vigil.toml",
+            "name = \"Niru Forest Night\"\nfocus = \"#102030\"\nmuted = \"bad\"\n",
+        );
+        let theme = theme_in(&config);
+        assert_eq!(theme.name, "Forest Night");
+        assert_eq!(theme.palette.accent, (0x10, 0x20, 0x30));
+        assert_eq!(theme.palette.muted, (0x96, 0xa2, 0x92));
+        // A custom theme with its own file.
+        fixture.write("niruwm/config.toml", "theme = \"my-own\"\n");
+        fixture.write(
+            "niruwm/themes/my-own.toml",
+            "name = \"Harbour\"\nforeground = \"aabbcc\"\n",
+        );
+        let theme = theme_in(&config);
+        assert_eq!(
+            (theme.id.as_str(), theme.name.as_str()),
+            ("my-own", "Harbour")
+        );
+        assert_eq!(theme.palette.foreground, (0xaa, 0xbb, 0xcc));
+        // A path-like id is never looked up as a file.
+        fixture.write("niruwm/config.toml", "theme = \"../../etc\"\n");
+        assert_eq!(theme_in(&config).name, "../../etc");
     }
 
     fn separator_columns(lines: &[String]) -> Vec<usize> {
