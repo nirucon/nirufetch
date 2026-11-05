@@ -1,4 +1,7 @@
 mod full;
+mod json;
+
+use json::Json;
 
 use std::{
     env, fs,
@@ -966,6 +969,172 @@ fn rows(info: &Info, full: bool) -> Vec<(String, String)> {
     rows
 }
 
+fn bytes_json(pair: Option<(u64, u64)>) -> Json {
+    pair.map(|(used, total)| {
+        Json::Obj(vec![
+            ("used_bytes", Json::Int(used)),
+            ("total_bytes", Json::Int(total)),
+        ])
+    })
+    .unwrap_or(Json::Null)
+}
+
+/// The `--json` document: the same fields as `--full`, with raw values.
+fn info_json(info: &Info) -> Json {
+    let opt_int = |value: Option<usize>| value.map(|v| Json::Int(v as u64)).unwrap_or(Json::Null);
+    let mut fields = vec![
+        ("nirufetch", Json::str(env!("CARGO_PKG_VERSION"))),
+        ("user", Json::str(&info.user)),
+        ("host", Json::str(&info.host)),
+        ("os", Json::str(&info.os)),
+        (
+            "nirux",
+            match &info.nirux.suite {
+                Some(suite) => Json::Obj(vec![
+                    ("suite", Json::str(suite)),
+                    (
+                        "components",
+                        Json::Arr(
+                            info.nirux
+                                .components
+                                .iter()
+                                .map(|(name, version)| {
+                                    Json::Obj(vec![
+                                        ("name", Json::str(name)),
+                                        ("version", Json::str(version)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ]),
+                None => Json::Null,
+            },
+        ),
+        ("kernel", Json::str(&info.kernel)),
+        ("uptime_seconds", Json::Int(info.uptime)),
+        ("shell", Json::str(&info.shell)),
+        ("wm", Json::str(&info.wm)),
+        ("terminal", Json::str(&info.terminal)),
+        (
+            "cpu",
+            Json::Obj(vec![
+                ("model", Json::str(&info.cpu.model)),
+                ("name", Json::str(short_cpu(&info.cpu.model))),
+                ("cores", opt_int(info.cpu.cores)),
+                ("threads", opt_int(info.cpu.threads)),
+            ]),
+        ),
+        ("memory", bytes_json(info.memory)),
+        ("disk", bytes_json(info.disk)),
+        (
+            "theme",
+            Json::Obj(vec![
+                ("id", Json::str(&info.theme.id)),
+                ("name", Json::str(&info.theme.name)),
+            ]),
+        ),
+    ];
+    if let Some(extra) = &info.extra {
+        fields.extend([
+            (
+                "gpus",
+                Json::Arr(
+                    extra
+                        .gpus
+                        .iter()
+                        .map(|gpu| {
+                            Json::Obj(vec![
+                                ("card", Json::str(&gpu.card)),
+                                ("vendor_id", Json::str(format!("{:04x}", gpu.vendor_id))),
+                                ("device_id", Json::str(format!("{:04x}", gpu.device_id))),
+                                ("name", Json::opt_str(gpu.name.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "displays",
+                Json::Arr(
+                    extra
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            Json::Obj(vec![
+                                ("connector", Json::str(&output.connector)),
+                                ("preferred_mode", Json::str(&output.preferred_mode)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "batteries",
+                Json::Arr(
+                    extra
+                        .batteries
+                        .iter()
+                        .map(|battery| {
+                            Json::Obj(vec![
+                                ("name", Json::str(&battery.name)),
+                                (
+                                    "capacity",
+                                    battery
+                                        .capacity
+                                        .map(|c| Json::Int(c.into()))
+                                        .unwrap_or(Json::Null),
+                                ),
+                                ("status", Json::opt_str(battery.status.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("swap", bytes_json(extra.swap)),
+            (
+                "load",
+                extra
+                    .load
+                    .map(|load| Json::Arr(load.iter().map(|&v| Json::Num(v)).collect()))
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "packages",
+                Json::Arr(
+                    extra
+                        .packages
+                        .iter()
+                        .map(|(manager, count)| {
+                            Json::Obj(vec![
+                                ("manager", Json::str(*manager)),
+                                ("count", Json::Int(*count as u64)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("locale", Json::opt_str(extra.locale.clone())),
+            (
+                "extras",
+                Json::Arr(
+                    extra
+                        .extras
+                        .iter()
+                        .map(|(name, pinned)| {
+                            Json::Obj(vec![
+                                ("name", Json::str(name)),
+                                ("pinned", Json::opt_str(pinned.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+    }
+    Json::Obj(fields)
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--version") {
@@ -974,9 +1143,10 @@ fn main() {
     }
     if args.iter().any(|arg| arg == "--help") {
         println!(
-            "Usage: nirufetch [--classic] [--compact] [--full] [--no-color] [--no-logo] [--plain]"
+            "Usage: nirufetch [--classic] [--compact] [--full] [--json] [--no-color] [--no-logo] [--plain]"
         );
         println!("NIRU terminal system fetch. Reads local files; no network or daemon.");
+        println!("--json prints every --full field as JSON (for scripts and bug reports).");
         return;
     }
     let flag = |name: &str| args.iter().any(|arg| arg == name);
@@ -992,6 +1162,10 @@ fn main() {
         palette: theme.palette,
     };
     let sys = Sys::from_env();
+    if flag("--json") {
+        println!("{}", info_json(&collect(&sys, theme, true)).render());
+        return;
+    }
     let info = collect(&sys, theme, full);
     let title = format!("{}@{}", info.user, info.host);
     let rows = rows(&info, full);
@@ -1349,6 +1523,121 @@ pub(crate) mod tests {
         // A path-like id is never looked up as a file.
         fixture.write("niruwm/config.toml", "theme = \"../../etc\"\n");
         assert_eq!(theme_in(&config).name, "../../etc");
+    }
+
+    fn sample_info() -> Info {
+        Info {
+            user: "ni\"ru".into(),
+            host: "host\\name".into(),
+            os: "Debian GNU/Linux 13 (trixie)".into(),
+            nirux: parse_manifest("suite 0.12.205\nniruwm 0.16.172\n"),
+            kernel: "6.12".into(),
+            uptime: 3_600,
+            shell: "fish".into(),
+            wm: "NIRUWM 0.16.172".into(),
+            terminal: "kitty\u{1b}[0m".into(),
+            cpu: Cpu {
+                model: "Intel(R) Xeon(R) W-1250 CPU @ 3.30GHz".into(),
+                cores: Some(6),
+                threads: Some(12),
+            },
+            memory: Some((1, 2)),
+            disk: None,
+            theme: Theme {
+                id: "niru-forest-vigil".into(),
+                name: "Forest Vigil".into(),
+                palette: Palette::default(),
+            },
+            extra: Some(Extra {
+                gpus: vec![full::Gpu {
+                    card: "card1".into(),
+                    vendor_id: 0x1002,
+                    device_id: 0x73ff,
+                    name: Some("AMD Radeon RX 6600".into()),
+                }],
+                outputs: vec![full::Output {
+                    connector: "DP-5".into(),
+                    preferred_mode: "2560x1440".into(),
+                }],
+                batteries: vec![],
+                locale: Some("sv_SE.UTF-8".into()),
+                packages: vec![("dpkg", 2345)],
+                swap: Some((0, 0)),
+                load: Some([0.5, 0.25, 1.0]),
+                extras: vec![("nplay".into(), Some("1.8.0".into())), ("x".into(), None)],
+            }),
+        }
+    }
+
+    #[test]
+    fn json_output_is_valid_and_complete() {
+        use json::check::{parse, Value};
+        let text = info_json(&sample_info()).render();
+        let doc = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        for key in [
+            "nirufetch",
+            "user",
+            "host",
+            "os",
+            "nirux",
+            "kernel",
+            "uptime_seconds",
+            "shell",
+            "wm",
+            "terminal",
+            "cpu",
+            "memory",
+            "disk",
+            "theme",
+            "gpus",
+            "displays",
+            "batteries",
+            "swap",
+            "load",
+            "packages",
+            "locale",
+            "extras",
+        ] {
+            assert!(doc.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(doc.get("user"), Some(&Value::Str("ni\"ru".into())));
+        assert_eq!(doc.get("host"), Some(&Value::Str("host\\name".into())));
+        assert_eq!(
+            doc.get("terminal"),
+            Some(&Value::Str("kitty\u{1b}[0m".into()))
+        );
+        assert_eq!(doc.get("disk"), Some(&Value::Null));
+        let cpu = doc.get("cpu").unwrap();
+        assert_eq!(
+            cpu.get("name"),
+            Some(&Value::Str("Intel Xeon W-1250".into()))
+        );
+        assert_eq!(cpu.get("threads"), Some(&Value::Num(12.0)));
+        let suite = doc.get("nirux").unwrap().get("suite");
+        assert_eq!(suite, Some(&Value::Str("0.12.205".into())));
+        assert!(!text.contains('\u{1b}'), "raw escape byte in JSON");
+        // Without extra data and without NIRUX it is still valid.
+        let mut bare = sample_info();
+        bare.extra = None;
+        bare.nirux = Nirux::default();
+        let doc = parse(&info_json(&bare).render()).unwrap();
+        assert_eq!(doc.get("nirux"), Some(&Value::Null));
+        assert!(doc.get("gpus").is_none());
+    }
+
+    #[test]
+    fn full_rows_include_the_extra_fields() {
+        let info = sample_info();
+        let labels: Vec<String> = rows(&info, true).into_iter().map(|(l, _)| l).collect();
+        for label in [
+            "GPU", "Swap", "Display", "Packages", "Locale", "Load", "Extras",
+        ] {
+            assert!(labels.iter().any(|l| l == label), "missing {label}");
+        }
+        let short: Vec<String> = rows(&info, false).into_iter().map(|(l, _)| l).collect();
+        assert!(!short.iter().any(|l| l == "GPU"));
+        let theme = rows(&info, true).into_iter().find(|(l, _)| l == "Theme");
+        assert_eq!(theme.unwrap().1, "Forest Vigil (niru-forest-vigil)");
     }
 
     fn separator_columns(lines: &[String]) -> Vec<usize> {
