@@ -1,9 +1,34 @@
 use std::{
     env, fs,
     io::{self, IsTerminal},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
+
+/// Where system files are read from. `NIRUFETCH_ROOT` points it at a fixture
+/// tree (for tests); normally it is `/`.
+struct Sys {
+    root: PathBuf,
+}
+
+impl Sys {
+    fn from_env() -> Self {
+        Self {
+            root: env::var_os("NIRUFETCH_ROOT")
+                .filter(|root| !root.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
+        }
+    }
+
+    fn path(&self, absolute: &str) -> PathBuf {
+        self.root.join(absolute.trim_start_matches('/'))
+    }
+
+    fn read(&self, absolute: &str) -> String {
+        read(self.path(absolute))
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -129,6 +154,139 @@ fn disk() -> Option<(u64, u64)> {
     let total = stat.f_blocks as u64 * stat.f_frsize as u64;
     let free = stat.f_bavail as u64 * stat.f_frsize as u64;
     Some((total - free, total))
+}
+
+/// Known terminal emulators, by process name (`comm`, at most 15 bytes) or
+/// executable basename, and the name shown for each.
+const TERMINALS: &[(&str, &str)] = &[
+    ("kitty", "kitty"),
+    ("alacritty", "alacritty"),
+    ("foot", "foot"),
+    ("footclient", "foot"),
+    ("wezterm", "wezterm"),
+    ("wezterm-gui", "wezterm"),
+    ("xterm", "xterm"),
+    ("uxterm", "xterm"),
+    ("st", "st"),
+    ("st-256color", "st"),
+    ("urxvt", "urxvt"),
+    ("urxvtd", "urxvt"),
+    ("rxvt", "rxvt"),
+    ("gnome-terminal", "gnome-terminal"),
+    ("gnome-terminal-", "gnome-terminal"),
+    ("gnome-terminal-server", "gnome-terminal"),
+    ("kgx", "gnome-console"),
+    ("ptyxis", "ptyxis"),
+    ("ptyxis-agent", "ptyxis"),
+    ("konsole", "konsole"),
+    ("xfce4-terminal", "xfce4-terminal"),
+    ("mate-terminal", "mate-terminal"),
+    ("lxterminal", "lxterminal"),
+    ("qterminal", "qterminal"),
+    ("terminator", "terminator"),
+    ("tilix", "tilix"),
+    ("sakura", "sakura"),
+    ("terminology", "terminology"),
+    ("ghostty", "ghostty"),
+    ("rio", "rio"),
+    ("contour", "contour"),
+    ("blackbox", "blackbox"),
+    ("cool-retro-term", "cool-retro-term"),
+    ("tilda", "tilda"),
+    ("guake", "guake"),
+    ("yakuake", "yakuake"),
+];
+
+fn known_terminal(name: &str) -> Option<&'static str> {
+    TERMINALS
+        .iter()
+        .find(|(process, _)| *process == name)
+        .map(|(_, shown)| *shown)
+}
+
+/// The parent pid and `comm` of a process, from `/proc/<pid>/stat`. `comm` is
+/// in parentheses and may itself contain spaces or parentheses.
+fn proc_stat(sys: &Sys, pid: u32) -> Option<(u32, String)> {
+    let text = sys.read(&format!("/proc/{pid}/stat"));
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    let comm = text.get(open + 1..close)?.to_string();
+    let ppid = text
+        .get(close + 1..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((ppid, comm))
+}
+
+/// Walk up from `start` to the first known terminal emulator, checking each
+/// process's `comm` and then its executable. Bounded, file reads only.
+fn terminal_from_parents(sys: &Sys, start: u32) -> Option<&'static str> {
+    let mut pid = start;
+    for _ in 0..64 {
+        if pid <= 1 {
+            return None;
+        }
+        let (ppid, comm) = proc_stat(sys, pid)?;
+        if let Some(found) = known_terminal(&comm) {
+            return Some(found);
+        }
+        if let Ok(exe) = fs::read_link(sys.path(&format!("/proc/{pid}/exe"))) {
+            if let Some(found) = exe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(known_terminal)
+            {
+                return Some(found);
+            }
+        }
+        if ppid == pid {
+            return None;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// Normalise `$TERM_PROGRAM` / `$TERM` when no parent process is a terminal
+/// (over SSH, inside a multiplexer, or on the console).
+fn terminal_from_env(term_program: Option<&str>, term: Option<&str>) -> String {
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(program) = clean(term_program) {
+        let lower = program.to_ascii_lowercase();
+        return known_terminal(&lower)
+            .map(str::to_string)
+            .unwrap_or(program);
+    }
+    match clean(term).as_deref() {
+        None | Some("dumb") => "tty".into(),
+        Some("linux") => "Linux console".into(),
+        Some(term) => {
+            let base = term.strip_prefix("xterm-").unwrap_or(term);
+            let base = base.strip_suffix("-256color").unwrap_or(base);
+            known_terminal(base)
+                .map(str::to_string)
+                .unwrap_or_else(|| term.to_string())
+        }
+    }
+}
+
+fn terminal(sys: &Sys) -> String {
+    let parent = unsafe { libc::getppid() };
+    terminal_from_parents(sys, parent.max(0) as u32)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            terminal_from_env(
+                env::var("TERM_PROGRAM").ok().as_deref(),
+                env::var("TERM").ok().as_deref(),
+            )
+        })
 }
 
 fn cpu_model() -> String {
@@ -307,6 +465,7 @@ fn main() {
             .iter()
             .any(|arg| arg == "--no-logo" || arg == "--plain");
     let (theme_name, _) = theme();
+    let sys = Sys::from_env();
     let mem = memory();
     let disk = disk();
     let mut info = vec![
@@ -321,15 +480,7 @@ fn main() {
             "WM".to_string(),
             component(env::var("XDG_CURRENT_DESKTOP").ok(), "unknown"),
         ),
-        (
-            "Terminal".to_string(),
-            component(
-                env::var("TERM_PROGRAM")
-                    .ok()
-                    .or_else(|| env::var("TERM").ok()),
-                "tty",
-            ),
-        ),
+        ("Terminal".to_string(), terminal(&sys)),
         ("CPU".to_string(), cpu_model()),
         (
             "Memory".to_string(),
@@ -413,7 +564,6 @@ fn main() {
             let display = match info[index].0.as_str() {
                 "OS" if !full => value.replace("Debian GNU/Linux", "Debian"),
                 "CPU" if !full => short_cpu(value),
-                "Terminal" if !full && value == "xterm-kitty" => "kitty".into(),
                 _ => value.clone(),
             };
             if width <= label_width + gap {
@@ -546,6 +696,86 @@ mod tests {
     fn cpu_shortening_removes_trademark_and_frequency() {
         let short = short_cpu("11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz");
         assert_eq!(short, "11th Gen Intel Core i7-1165G7");
+    }
+
+    /// A throw-away fixture root under the temp dir, removed on drop.
+    pub(crate) struct Fixture {
+        pub root: PathBuf,
+    }
+
+    impl Fixture {
+        pub fn new(name: &str) -> Self {
+            let root =
+                env::temp_dir().join(format!("nirufetch-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        pub fn write(&self, path: &str, text: &str) {
+            let path = self.root.join(path.trim_start_matches('/'));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+
+        pub fn sys(&self) -> Sys {
+            Sys {
+                root: self.root.clone(),
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn process(fixture: &Fixture, pid: u32, comm: &str, ppid: u32) {
+        fixture.write(
+            &format!("/proc/{pid}/stat"),
+            &format!("{pid} ({comm}) S {ppid} {pid} {pid} 34816 0 0 0\n"),
+        );
+    }
+
+    #[test]
+    fn terminal_walks_parents_to_the_first_emulator() {
+        let fixture = Fixture::new("terminal-walk");
+        // init → kitty → fish → tmux client (odd comm) → our shell
+        process(&fixture, 1, "systemd", 0);
+        process(&fixture, 40, "kitty", 1);
+        process(&fixture, 41, "fish", 40);
+        process(&fixture, 42, "weird (name) x", 41);
+        process(&fixture, 43, "bash", 42);
+        assert_eq!(terminal_from_parents(&fixture.sys(), 43), Some("kitty"));
+        // gnome-terminal-server is truncated to 15 bytes in comm.
+        process(&fixture, 50, "gnome-terminal-", 1);
+        process(&fixture, 51, "bash", 50);
+        assert_eq!(
+            terminal_from_parents(&fixture.sys(), 51),
+            Some("gnome-terminal")
+        );
+        // No emulator in the chain (an SSH login).
+        process(&fixture, 60, "sshd", 1);
+        process(&fixture, 61, "fish", 60);
+        assert_eq!(terminal_from_parents(&fixture.sys(), 61), None);
+        // A loop or a missing process ends the walk.
+        process(&fixture, 70, "bash", 70);
+        assert_eq!(terminal_from_parents(&fixture.sys(), 70), None);
+        assert_eq!(terminal_from_parents(&fixture.sys(), 999), None);
+    }
+
+    #[test]
+    fn terminal_env_fallback_normalises_names() {
+        assert_eq!(terminal_from_env(Some("WezTerm"), Some("x")), "wezterm");
+        assert_eq!(terminal_from_env(Some("vscode"), None), "vscode");
+        assert_eq!(terminal_from_env(None, Some("xterm-kitty")), "kitty");
+        assert_eq!(terminal_from_env(None, Some("foot")), "foot");
+        assert_eq!(terminal_from_env(None, Some("st-256color")), "st");
+        assert_eq!(terminal_from_env(None, Some("dumb")), "tty");
+        assert_eq!(terminal_from_env(None, None), "tty");
+        assert_eq!(terminal_from_env(None, Some("linux")), "Linux console");
+        assert_eq!(terminal_from_env(None, Some("screen")), "screen");
     }
 
     fn separator_columns(lines: &[String]) -> Vec<usize> {
