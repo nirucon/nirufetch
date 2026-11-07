@@ -11,7 +11,7 @@ Fast, local terminal system summary in the NIRUX visual style.
 NIRUFETCH is a terminal system fetch for NIRUX. It reads `/proc`, `/sys`,
 `/etc`, the NIRUX generation manifest and the NIRUWM theme; there is no network,
 daemon or background service, and it starts no other process. A run takes a few
-milliseconds. NIRU Launcher's Health view uses its JSON output.
+milliseconds.
 
 ## Features
 
@@ -25,7 +25,7 @@ milliseconds. NIRU Launcher's Health view uses its JSON output.
   256 or 16 colours depending on the terminal.
 - NIRUX and NIRUWM versions from the installed generation, the same versions
   `nirux --version` and `nirux update` report.
-- `--json` with every `--full` field, for scripts, the launcher and bug reports.
+- `--json` with every `--full` field, for scripts and bug reports.
 
 ## Requirements
 
